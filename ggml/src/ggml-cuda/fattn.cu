@@ -699,11 +699,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // Tuning knob: GGML_CUDA_FA_PREFER_VEC=1 uses the vector kernel for batch size 1 even if the GQA opt of the tile kernel applies.
+    static const bool prefer_vec = [] {
+        const char * env = getenv("GGML_CUDA_FA_PREFER_VEC");
+        return env != nullptr && atoi(env) == 1;
+    }();
+
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
-                if (!gqa_opt_applies) {
+                if (!gqa_opt_applies || prefer_vec) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             }
