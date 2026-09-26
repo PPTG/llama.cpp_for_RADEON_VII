@@ -700,6 +700,18 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    for (ggml_cuda_staged_copy_slot & slot : staged_copy_slots) {
+        if (slot.h2d_done != nullptr) {
+            CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
+            CUDA_CHECK(cudaEventDestroy(slot.h2d_done));
+        }
+        if (slot.d2h_done != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(slot.d2h_done));
+        }
+        if (slot.host != nullptr) {
+            CUDA_CHECK(cudaFreeHost(slot.host));
+        }
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2479,6 +2491,65 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// GGML_CUDA_STAGED_COPY=1: copy between GPUs through pinned host memory with async D2H + H2D, instead of cudaMemcpyPeerAsync.
+// Without peer access (no P2P/bridge) the HIP runtime peer copy can stall the host, this path never does.
+static bool ggml_cuda_use_staged_copy() {
+    static const bool use = [] {
+        const char * env = getenv("GGML_CUDA_STAGED_COPY");
+        return env != nullptr && atoi(env) == 1;
+    }();
+    return use;
+}
+
+static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst, void * dst, const void * src, const size_t nbytes) {
+    ggml_cuda_staged_copy_slot & slot = ctx_src->staged_copy_slots[ctx_src->staged_copy_next];
+    ctx_src->staged_copy_next = (ctx_src->staged_copy_next + 1) % GGML_CUDA_STAGED_COPY_SLOTS;
+
+    // the h2d event must live on the dst device
+    if (slot.dst_device != ctx_dst->device) {
+        if (slot.h2d_done != nullptr) {
+            CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
+            ggml_cuda_set_device(slot.dst_device);
+            CUDA_CHECK(cudaEventDestroy(slot.h2d_done));
+        }
+        ggml_cuda_set_device(ctx_dst->device);
+        CUDA_CHECK(cudaEventCreateWithFlags(&slot.h2d_done, cudaEventDisableTiming));
+        slot.dst_device = ctx_dst->device;
+        slot.used       = false;
+    }
+
+    if (slot.size < nbytes) {
+        if (slot.host != nullptr) {
+            if (slot.used) {
+                CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
+            }
+            CUDA_CHECK(cudaFreeHost(slot.host));
+        }
+        slot.size = std::max(nbytes, (size_t) 64*1024);
+        CUDA_CHECK(cudaMallocHost(&slot.host, slot.size));
+        slot.used = false;
+    }
+
+    ggml_cuda_set_device(ctx_src->device);
+    if (slot.d2h_done == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&slot.d2h_done, cudaEventDisableTiming));
+    }
+    // do not overwrite the slot before the previous H2D from it is done
+    if (slot.used) {
+        CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), slot.h2d_done, 0));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(slot.host, src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream()));
+    CUDA_CHECK(cudaEventRecord(slot.d2h_done, ctx_src->stream()));
+
+    ggml_cuda_set_device(ctx_dst->device);
+    CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), slot.d2h_done, 0));
+    CUDA_CHECK(cudaMemcpyAsync(dst, slot.host, nbytes, cudaMemcpyHostToDevice, ctx_dst->stream()));
+    CUDA_CHECK(cudaEventRecord(slot.h2d_done, ctx_dst->stream()));
+    slot.used = true;
+
+    ggml_cuda_set_device(ctx_src->device);
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -2513,6 +2584,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        } else if (ggml_cuda_use_staged_copy()) {
+            ggml_cuda_staged_copy(cuda_ctx_src, cuda_ctx_dst, dst->data, src->data, ggml_nbytes(dst));
+            return true;
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;

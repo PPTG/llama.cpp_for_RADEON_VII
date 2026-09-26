@@ -1520,10 +1520,25 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Pinned host buffer used to move a tensor between 2 GPUs without peer access: D2H on the src stream, H2D on the dst stream.
+struct ggml_cuda_staged_copy_slot {
+    void *      host       = nullptr;
+    size_t      size       = 0;
+    int         dst_device = -1;
+    bool        used       = false;   // h2d_done was recorded at least once
+    cudaEvent_t d2h_done   = nullptr; // created on the src device
+    cudaEvent_t h2d_done   = nullptr; // created on the dst device
+};
+
+static constexpr int GGML_CUDA_STAGED_COPY_SLOTS = 8;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    ggml_cuda_staged_copy_slot staged_copy_slots[GGML_CUDA_STAGED_COPY_SLOTS];
+    int staged_copy_next = 0;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
