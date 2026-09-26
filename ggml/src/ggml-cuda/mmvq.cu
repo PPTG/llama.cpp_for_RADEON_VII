@@ -93,6 +93,14 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
+// Number of warps per block used by MMVQ on GCN/CDNA for a single token (token generation).
+// Can be overridden at build time with -DGGML_HIP_MMVQ_GCN_NWARPS=<1|2|4|8> for tuning, e.g. on gfx906.
+#ifndef GGML_HIP_MMVQ_GCN_NWARPS
+#define GGML_HIP_MMVQ_GCN_NWARPS 2
+#endif // GGML_HIP_MMVQ_GCN_NWARPS
+static_assert(GGML_HIP_MMVQ_GCN_NWARPS == 1 || GGML_HIP_MMVQ_GCN_NWARPS == 2 ||
+              GGML_HIP_MMVQ_GCN_NWARPS == 4 || GGML_HIP_MMVQ_GCN_NWARPS == 8, "unsupported GGML_HIP_MMVQ_GCN_NWARPS");
+
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
     MMVQ_PARAMETERS_TURING,
@@ -468,6 +476,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
+                return GGML_HIP_MMVQ_GCN_NWARPS;
             case 2:
             case 3:
             case 4:

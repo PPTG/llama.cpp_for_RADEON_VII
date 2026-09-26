@@ -101,6 +101,14 @@ if (GGML_HIP_GRAPHS)
     add_compile_definitions(GGML_HIP_GRAPHS)
 endif()
 
+if (GGML_HIP_NO_DPP_REDUCE)
+    add_compile_definitions(GGML_HIP_NO_DPP_REDUCE)
+endif()
+
+if (GGML_HIP_MMVQ_GCN_NWARPS)
+    add_compile_definitions(GGML_HIP_MMVQ_GCN_NWARPS=${GGML_HIP_MMVQ_GCN_NWARPS})
+endif()
+
 if (GGML_HIP_NO_VMM)
     add_compile_definitions(GGML_HIP_NO_VMM)
 endif()

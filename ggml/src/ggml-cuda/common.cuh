@@ -451,10 +451,67 @@ struct ggml_cuda_unroll<1> {
     }
 };
 
+// GCN5 (gfx900/gfx906, e.g. Radeon VII / Instinct MI50/MI60) specific warp reductions.
+// __shfl_xor compiles to ds_bpermute_b32 on AMD, which goes through the LDS unit and has to wait for lgkmcnt at every
+// step of the butterfly. On GCN the first 4 steps can instead be done with DPP lane permutes, which are free VALU source
+// modifiers, the 5th step with a single ds_swizzle (no address computation) and the last step (only for width 64) with
+// two v_readlane_b32. The DPP row_mirror/row_half_mirror patterns are only equivalent to xor 4/8 because after the
+// previous butterfly steps all lanes of the lower subgroup hold the same value, so this is only valid for reductions.
+#if defined(GGML_USE_HIP) && defined(GCN5) && !defined(GGML_HIP_NO_DPP_REDUCE)
+#define GGML_HIP_DPP_REDUCE
+
+template <int dpp_ctrl, typename T>
+static __device__ __forceinline__ T ggml_hip_dpp_mov(const T x) {
+    static_assert(sizeof(T) == sizeof(int), "DPP moves are only implemented for 32 bit types");
+    return __builtin_bit_cast(T, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, x), dpp_ctrl, 0xF, 0xF, true));
+}
+
+template <typename T>
+static __device__ __forceinline__ T ggml_hip_swizzle_xor16(const T x) {
+    static_assert(sizeof(T) == sizeof(int), "swizzle is only implemented for 32 bit types");
+    // bitmask mode: and_mask = 0x1F, or_mask = 0, xor_mask = 0x10
+    return __builtin_bit_cast(T, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, x), 0x401F));
+}
+
+template <typename T>
+static __device__ __forceinline__ T ggml_hip_readlane(const T x, const int lane) {
+    static_assert(sizeof(T) == sizeof(int), "readlane is only implemented for 32 bit types");
+    return __builtin_bit_cast(T, __builtin_amdgcn_readlane(__builtin_bit_cast(int, x), lane));
+}
+
+// Butterfly reduction over groups of `width` lanes, every lane of a group ends up with the result.
+template <int width, typename T, typename Op>
+static __device__ __forceinline__ T ggml_hip_warp_reduce_dpp(T x, const Op op) {
+    static_assert(width == 1 || width == 2 || width == 4 || width == 8 || width == 16 || width == 32 || width == 64,
+        "unsupported width");
+    if constexpr (width > 1) {
+        x = op(x, ggml_hip_dpp_mov<0xB1>(x)); // quad_perm:[1,0,3,2] == xor 1
+    }
+    if constexpr (width > 2) {
+        x = op(x, ggml_hip_dpp_mov<0x4E>(x)); // quad_perm:[2,3,0,1] == xor 2
+    }
+    if constexpr (width > 4) {
+        x = op(x, ggml_hip_dpp_mov<0x141>(x)); // row_half_mirror, equivalent to xor 4 here
+    }
+    if constexpr (width > 8) {
+        x = op(x, ggml_hip_dpp_mov<0x140>(x)); // row_mirror, equivalent to xor 8 here
+    }
+    if constexpr (width > 16) {
+        x = op(x, ggml_hip_swizzle_xor16(x));
+    }
+    if constexpr (width > 32) {
+        x = op(ggml_hip_readlane(x, 0), ggml_hip_readlane(x, 32));
+    }
+    return x;
+}
+#endif // defined(GGML_USE_HIP) && defined(GCN5) && !defined(GGML_HIP_NO_DPP_REDUCE)
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
     return __reduce_add_sync(0xffffffff, x);
+#elif defined(GGML_HIP_DPP_REDUCE)
+    return ggml_hip_warp_reduce_dpp<width>(x, [](const int a, const int b) { return a + b; });
 #else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
@@ -466,26 +523,39 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#ifdef GGML_HIP_DPP_REDUCE
+    return ggml_hip_warp_reduce_dpp<width>(x, [](const float a, const float b) { return a + b; });
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
+#endif // GGML_HIP_DPP_REDUCE
 }
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
+#ifdef GGML_HIP_DPP_REDUCE
+    a.x = warp_reduce_sum<width>(a.x);
+    a.y = warp_reduce_sum<width>(a.y);
+    return a;
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         a.x += __shfl_xor_sync(0xffffffff, a.x, offset, width);
         a.y += __shfl_xor_sync(0xffffffff, a.y, offset, width);
     }
     return a;
+#endif // GGML_HIP_DPP_REDUCE
 }
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
 #ifdef FP16_AVAILABLE
+#ifdef GGML_HIP_DPP_REDUCE
+    return ggml_hip_warp_reduce_dpp<width>(a, [](const half2 u, const half2 v) { return __hadd2(u, v); });
+#endif // GGML_HIP_DPP_REDUCE
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         a = __hadd2(a, __shfl_xor_sync(0xffffffff, a, offset, width));
@@ -526,11 +596,15 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_max(float x) {
+#ifdef GGML_HIP_DPP_REDUCE
+    return ggml_hip_warp_reduce_dpp<width>(x, [](const float a, const float b) { return fmaxf(a, b); });
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
     }
     return x;
+#endif // GGML_HIP_DPP_REDUCE
 }
 
 template<typename T, int width = WARP_SIZE>
@@ -692,6 +766,9 @@ static __device__ __forceinline__ half2 ggml_cuda_hmax2(const half2 a, const hal
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
+#ifdef GGML_HIP_DPP_REDUCE
+    return ggml_hip_warp_reduce_dpp<width>(x, [](const half2 a, const half2 b) { return ggml_cuda_hmax2(a, b); });
+#endif // GGML_HIP_DPP_REDUCE
 #pragma unroll
    for (int offset = width/2; offset > 0; offset >>= 1) {
        x = ggml_cuda_hmax2(x, __shfl_xor_sync(0xffffffff, x, offset, width));
