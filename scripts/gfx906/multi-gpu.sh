@@ -19,9 +19,9 @@ run_bench() {
 }
 
 SM=none   run_bench "1 GPU (reference)"
-SM=layer  run_bench "layer"
-SM=layer  run_bench "layer + STAGED_COPY"      GGML_CUDA_STAGED_COPY=1
-SM=layer  run_bench "layer + P2P"              GGML_CUDA_P2P=1
+SM=layer  run_bench "layer (staged copy, default)"
+SM=layer  run_bench "layer, peer copy"             GGML_CUDA_STAGED_COPY=0
+SM=layer  run_bench "layer, peer copy + P2P"       GGML_CUDA_STAGED_COPY=0 GGML_CUDA_P2P=1
 SM=tensor run_bench "tensor + P2P"             GGML_CUDA_P2P=1
 SM=tensor run_bench "tensor + P2P + AR_P2P"    GGML_CUDA_P2P=1 GGML_CUDA_AR_P2P=1
 
@@ -46,5 +46,5 @@ check() {
         echo "--- new: $(echo "${out}" | head -c 300)"
     fi
 }
-check "LLAMA_ARG_SPLIT_MODE=layer" "LLAMA_ARG_SPLIT_MODE=layer GGML_CUDA_STAGED_COPY=1"
+check "LLAMA_ARG_SPLIT_MODE=layer GGML_CUDA_STAGED_COPY=0" "LLAMA_ARG_SPLIT_MODE=layer"
 check "LLAMA_ARG_SPLIT_MODE=tensor GGML_CUDA_P2P=1" "LLAMA_ARG_SPLIT_MODE=tensor GGML_CUDA_P2P=1 GGML_CUDA_AR_P2P=1"

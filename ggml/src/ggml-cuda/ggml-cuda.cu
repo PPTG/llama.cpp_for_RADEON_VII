@@ -2491,12 +2491,19 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
-// GGML_CUDA_STAGED_COPY=1: copy between GPUs through pinned host memory with async D2H + H2D, instead of cudaMemcpyPeerAsync.
-// Without peer access (no P2P/bridge) the HIP runtime peer copy can stall the host, this path never does.
+// Copy between GPUs through pinned host memory with async D2H + H2D, instead of cudaMemcpyPeerAsync.
+// The HIP runtime peer copy can stall the host, this path never does. Default on for HIP, GGML_CUDA_STAGED_COPY=0/1 to override.
 static bool ggml_cuda_use_staged_copy() {
     static const bool use = [] {
         const char * env = getenv("GGML_CUDA_STAGED_COPY");
-        return env != nullptr && atoi(env) == 1;
+        if (env != nullptr) {
+            return atoi(env) == 1;
+        }
+#ifdef GGML_USE_HIP
+        return true;
+#else
+        return false;
+#endif // GGML_USE_HIP
     }();
     return use;
 }
