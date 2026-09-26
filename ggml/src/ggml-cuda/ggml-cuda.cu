@@ -3524,9 +3524,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// GGML_CUDA_FUSE_GATE_UP=0 disables the merged gate_up + glu fusion and the related alloc deps (for A/B tests).
+static bool ggml_cuda_fuse_gate_up_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_GATE_UP");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // Match mul_mat(_id) with merged gate_up weights -> view gate half -> view up half -> glu. Returns the node count or 0.
 static int ggml_cuda_match_merged_gate_up_glu(const ggml_cgraph * cgraph, const int i) {
-    if (i + 3 >= cgraph->n_nodes) {
+    if (!ggml_cuda_fuse_gate_up_enabled() || i + 3 >= cgraph->n_nodes) {
         return 0;
     }
     const ggml_tensor * mm  = cgraph->nodes[i];
@@ -4730,7 +4739,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 int glu_idx = -1;
                 if (is_mm && ggml_cuda_match_merged_gate_up_glu(cgraph, i) > 0) {
                     glu_idx = i + 3;
-                } else if (is_mm && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == node->op &&
+                } else if (is_mm && ggml_cuda_fuse_gate_up_enabled() && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == node->op &&
                         cgraph->nodes[i + 2]->op == GGML_OP_GLU && cgraph->nodes[i + 1]->src[1] == node->src[1]) {
                     glu_idx = i + 2;
                 }
