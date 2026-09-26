@@ -9,6 +9,7 @@
 #   VARIANTS="nodpp dpp nw1 nw4"  build variants to test (default: all)
 #   SKIP_BUILD=1                   reuse existing build dirs
 #   SKIP_TESTS=1                   skip test-backend-ops
+#   SKIP_BENCH=1                   skip llama-bench
 #   SKIP_PROFILE=1                 skip rocprofv3
 set -uo pipefail
 
@@ -90,12 +91,14 @@ if [ -z "${SKIP_TESTS:-}" ]; then
 fi
 
 # 3. token generation benchmark
-log "llama-bench tg"
-for V in ${VARIANTS}; do
-    echo "=== ${V}" | tee -a "${OUT}/summary.txt"
-    "build-${V}/bin/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -p 0 -n 128 -r 5 -d 0,4096 -o md 2> "${OUT}/bench-${V}.err" \
-        | tee "${OUT}/bench-${V}.md" | tee -a "${OUT}/summary.txt"
-done
+if [ -z "${SKIP_BENCH:-}" ]; then
+    log "llama-bench tg"
+    for V in ${VARIANTS}; do
+        echo "=== ${V}" | tee -a "${OUT}/summary.txt"
+        "build-${V}/bin/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -p 0 -n 128 -r 5 -d 0,4096 -o md 2> "${OUT}/bench-${V}.err" \
+            | tee "${OUT}/bench-${V}.md" | tee -a "${OUT}/summary.txt"
+    done
+fi
 
 # 4. kernel profile of the default build
 if [ -z "${SKIP_PROFILE:-}" ]; then
@@ -103,7 +106,7 @@ if [ -z "${SKIP_PROFILE:-}" ]; then
     [[ " ${VARIANTS} " == *" dpp "* ]] || PV=$(echo "${VARIANTS}" | awk '{print $1}')
     log "rocprofv3 (${PV})"
     if command -v rocprofv3 >/dev/null; then
-        rocprofv3 --kernel-trace --stats -d "${OUT}/prof" -o prof -- \
+        rocprofv3 --kernel-trace --stats --output-format csv -d "${OUT}/prof" -o prof -- \
             "build-${PV}/bin/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -p 0 -n 32 -r 1 > "${OUT}/prof.log" 2>&1
         STATS=$(find "${OUT}/prof" -name "*kernel_stats.csv" | head -n 1)
         if [ -n "${STATS}" ]; then
@@ -111,6 +114,7 @@ if [ -z "${SKIP_PROFILE:-}" ]; then
             head -n 26 "${STATS}" | cut -d, -f1-6 | tee -a "${OUT}/summary.txt"
         else
             echo "no kernel stats produced, see ${OUT}/prof.log" | tee -a "${OUT}/summary.txt"
+            tail -n 20 "${OUT}/prof.log" | tee -a "${OUT}/summary.txt"
         fi
         # drop the big per-dispatch trace, keep stats
         find "${OUT}/prof" -name "*kernel_trace.csv" -size +20M -delete
