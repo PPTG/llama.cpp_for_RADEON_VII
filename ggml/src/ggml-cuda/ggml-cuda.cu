@@ -3524,11 +3524,19 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
-// GGML_CUDA_FUSE_GATE_UP=0 disables the merged gate_up + glu fusion and the related alloc deps (for A/B tests).
+// GGML_CUDA_FUSE_GATE_UP=0/1: merged gate_up + glu fusion and the alloc deps that enable mm + glu fusions.
+// Default off on HIP: on gfx906 the fused kernel needs 2x the registers and is ~5% slower in tg (Gemma 4 26B A4B).
 static bool ggml_cuda_fuse_gate_up_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_FUSE_GATE_UP");
-        return env == nullptr || atoi(env) != 0;
+        if (env != nullptr) {
+            return atoi(env) != 0;
+        }
+#ifdef GGML_USE_HIP
+        return false;
+#else
+        return true;
+#endif // GGML_USE_HIP
     }();
     return enabled;
 }
