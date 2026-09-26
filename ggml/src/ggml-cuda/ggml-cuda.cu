@@ -3129,6 +3129,55 @@ struct ggml_cuda_moe_weighted_reduction_match {
 static bool ggml_cuda_match_moe_weighted_reduction(
         const ggml_cgraph * cgraph,
         int node_idx,
+        ggml_cuda_moe_weighted_reduction_match & match);
+
+// repeat(reshape(scale_vec)) -> get_rows(ids) that only feeds the expert_scale of a weighted reduction:
+// the reduction kernel can look up scale_vec[ids] itself. Returns the node count incl. the reduction, or 0.
+static int ggml_cuda_match_moe_scale_ids_reduction(
+        const ggml_cgraph * cgraph,
+        int node_idx,
+        ggml_cuda_moe_weighted_reduction_match & match,
+        const ggml_tensor *& scale_vec,
+        const ggml_tensor *& ids) {
+    if (node_idx + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * repeat   = cgraph->nodes[node_idx];
+    const ggml_tensor * get_rows = cgraph->nodes[node_idx + 1];
+    if (repeat->op != GGML_OP_REPEAT || get_rows->op != GGML_OP_GET_ROWS || get_rows->src[0] != repeat) {
+        return 0;
+    }
+    const ggml_tensor * vec = repeat->src[0];
+    const ggml_tensor * idx = get_rows->src[1];
+    if (vec->type != GGML_TYPE_F32 || !ggml_is_contiguous(vec) || vec->ne[0] != 1 || vec->ne[2] != 1 || vec->ne[3] != 1 ||
+            repeat->type != GGML_TYPE_F32 || repeat->ne[0] != 1 || repeat->ne[1] != vec->ne[1] ||
+            idx->type != GGML_TYPE_I32 || idx->nb[0] != sizeof(int32_t) || get_rows->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 2, match) || match.expert_scale != get_rows) {
+        return 0;
+    }
+    if (idx->ne[1] != match.experts->ne[2] * match.experts->ne[3] || idx->ne[0] < match.experts->ne[1]) {
+        return 0;
+    }
+
+    const int node_count = 2 + match.node_count;
+    std::vector<ggml_op> ops(node_count);
+    for (int j = 0; j < node_count; ++j) {
+        ops[j] = cgraph->nodes[node_idx + j]->op;
+    }
+    const int output_idx = node_idx + node_count - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+        return 0;
+    }
+    scale_vec = vec;
+    ids       = idx;
+    return node_count;
+}
+
+static bool ggml_cuda_match_moe_weighted_reduction(
+        const ggml_cgraph * cgraph,
+        int node_idx,
         ggml_cuda_moe_weighted_reduction_match & match) {
     const ggml_tensor * first = cgraph->nodes[node_idx];
     if (first->op != GGML_OP_MUL || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
@@ -3631,6 +3680,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_REPEAT) {
+        ggml_cuda_moe_weighted_reduction_match match;
+        const ggml_tensor * scale_vec = nullptr;
+        const ggml_tensor * ids       = nullptr;
+        if (const int n = ggml_cuda_match_moe_scale_ids_reduction(cgraph, i, match, scale_vec, ids); n > 0) {
+            const int output_idx = i + n - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, &output_idx, 1)) {
+                ggml_cuda_op_moe_weighted_reduction_ids(*cuda_ctx, match.experts, scale_vec, ids, match.weights, match.dst);
+                return n - 1;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
@@ -4770,6 +4832,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (match.expert_scale != nullptr) {
                     params->add_alloc_dep(
                         params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
+                    // the scale ids fusion reads the expert ids in the reduction kernel
+                    if (match.expert_scale->op == GGML_OP_GET_ROWS && match.expert_scale->src[0]->op == GGML_OP_REPEAT) {
+                        params->add_alloc_dep(params->user_data, match.expert_scale->src[1], match.dst);
+                    }
                 }
                 i += match.node_count - 1;
             }
