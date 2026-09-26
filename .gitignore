@@ -153,3 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# gfx906 benchmark results
+/results-gfx906/
+/results-gfx906-*.tar.gz
