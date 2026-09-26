@@ -110,8 +110,7 @@ if [ -z "${SKIP_PROFILE:-}" ]; then
             "build-${PV}/bin/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -p 0 -n 32 -r 1 > "${OUT}/prof.log" 2>&1
         STATS=$(find "${OUT}/prof" -name "*kernel_stats.csv" | head -n 1)
         if [ -n "${STATS}" ]; then
-            echo "top 25 kernels by total time:" | tee -a "${OUT}/summary.txt"
-            head -n 26 "${STATS}" | cut -d, -f1-6 | tee -a "${OUT}/summary.txt"
+            python3 scripts/gfx906/prof-top.py "${STATS}" 30 | tee -a "${OUT}/summary.txt"
         else
             echo "no kernel stats produced, see ${OUT}/prof.log" | tee -a "${OUT}/summary.txt"
             tail -n 20 "${OUT}/prof.log" | tee -a "${OUT}/summary.txt"
