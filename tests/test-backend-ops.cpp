@@ -3769,6 +3769,46 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// GGML_OP_RMS_NORM + GGML_OP_SCALE + GGML_OP_MUL (e.g. Gemma 4 MoE router input)
+struct test_rms_norm_scale_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool  weight_first;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, eps, weight_first);
+    }
+
+    test_rms_norm_scale_mul(std::array<int64_t, 4> ne = {64, 5, 4, 3}, float eps = 1e-6f, bool weight_first = false)
+        : ne(ne), eps(eps), weight_first(weight_first) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * c = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+
+        ggml_tensor * x = ggml_add(ctx, a, c);
+        ggml_tensor * r = ggml_rms_norm(ctx, x, eps);
+        ggml_tensor * s = ggml_scale(ctx, r, 1.0f / sqrtf((float) ne[0]));
+        ggml_tensor * out = weight_first ? ggml_mul(ctx, w, s) : ggml_mul(ctx, s, w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -9992,6 +10032,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
     }
 
+    for (int64_t n : { 64, 1536, 2816 }) {
+        for (bool weight_first : { false, true }) {
+            test_cases.emplace_back(new test_rms_norm_scale_mul({ n, 1, 1, 1 }, 1e-6f, weight_first));
+            test_cases.emplace_back(new test_rms_norm_scale_mul({ n, 5, 4, 3 }, 1e-6f, weight_first));
+        }
+    }
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true));
