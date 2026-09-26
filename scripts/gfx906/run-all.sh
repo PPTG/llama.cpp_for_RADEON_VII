@@ -95,7 +95,7 @@ if [ -z "${SKIP_BENCH:-}" ]; then
     log "llama-bench tg"
     for V in ${VARIANTS}; do
         echo "=== ${V}" | tee -a "${OUT}/summary.txt"
-        "build-${V}/bin/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -p 0 -n 128 -r 5 -d 0,4096 -o md 2> "${OUT}/bench-${V}.err" \
+        "build-${V}/bin/llama-bench" -m "${MODEL}" -ngl 99 -sm none -mg 0 -fa 1 -p 0 -n 128 -r 5 -d 0,4096 -o md 2> "${OUT}/bench-${V}.err" \
             | tee "${OUT}/bench-${V}.md" | tee -a "${OUT}/summary.txt"
     done
 fi
@@ -107,7 +107,7 @@ if [ -z "${SKIP_PROFILE:-}" ]; then
     log "rocprofv3 (${PV})"
     if command -v rocprofv3 >/dev/null; then
         rocprofv3 --kernel-trace --stats --output-format csv -d "${OUT}/prof" -o prof -- \
-            "build-${PV}/bin/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -p 0 -n 32 -r 1 > "${OUT}/prof.log" 2>&1
+            "build-${PV}/bin/llama-bench" -m "${MODEL}" -ngl 99 -sm none -mg 0 -fa 1 -p 0 -n 32 -r 1 > "${OUT}/prof.log" 2>&1
         STATS=$(find "${OUT}/prof" -name "*kernel_stats.csv" | head -n 1)
         if [ -n "${STATS}" ]; then
             python3 scripts/gfx906/prof-top.py "${STATS}" 30 | tee -a "${OUT}/summary.txt"

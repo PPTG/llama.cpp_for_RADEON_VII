@@ -10,5 +10,5 @@ shift
 
 for BUILD_DIR in "$@"; do
     echo "=== ${BUILD_DIR}"
-    "${BUILD_DIR}/bin/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -p 0 -n 128 -r 5 -d 0,4096 -o md
+    "${BUILD_DIR}/bin/llama-bench" -m "${MODEL}" -ngl 99 -sm none -mg 0 -fa 1 -p 0 -n 128 -r 5 -d 0,4096 -o md
 done
