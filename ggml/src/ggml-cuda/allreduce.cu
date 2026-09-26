@@ -335,7 +335,83 @@ struct ggml_cuda_ar_pipeline {
     // memory; CPU never reads/writes -- only the kernel and cudaMemset.
     // Use ggml_cuda_ar_arrival_ptr() to index.
     ggml_cuda_ar_host_mapping arrival;
+
+    // Optional P2P variant of the chunked kernel path (GGML_CUDA_AR_P2P=1, HIP only).
+    // Each GPU writes its data and arrival token directly into the VRAM of the peer and polls its own VRAM,
+    // so all reads are local and only posted writes cross PCIe. Buffers are uncached so peer writes are visible.
+    bool   p2p = false;
+    char * p2p_recv[GGML_CUDA_MAX_DEVICES]    = {};  // POOL_SIZE * buf_bytes, written by the peer
+    char * p2p_arrival[GGML_CUDA_MAX_DEVICES] = {};  // POOL_SIZE * KERNEL_BLOCKS * ARRIVAL_STRIDE, written by the peer
 };
+
+static size_t ggml_cuda_ar_p2p_arrival_bytes() {
+    return (size_t) GGML_CUDA_AR_POOL_SIZE * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+}
+
+static int * ggml_cuda_ar_p2p_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot, int device_idx) {
+    return reinterpret_cast<int *>(p->p2p_arrival[device_idx] + (size_t) slot * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE);
+}
+
+#ifdef GGML_USE_HIP
+static bool ggml_cuda_ar_p2p_init(ggml_cuda_ar_pipeline * p) {
+    const char * env = getenv("GGML_CUDA_AR_P2P");
+    if (env == nullptr || atoi(env) != 1 || p->n_devices != 2) {
+        return false;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        int can_access = 0;
+        CUDA_CHECK(hipDeviceCanAccessPeer(&can_access, p->devices[i], p->devices[1 - i]));
+        if (!can_access) {
+            GGML_LOG_WARN("%s: device %d can not access device %d, P2P AllReduce disabled\n",
+                          __func__, p->devices[i], p->devices[1 - i]);
+            return false;
+        }
+        ggml_cuda_set_device(p->devices[i]);
+        const hipError_t rc = hipDeviceEnablePeerAccess(p->devices[1 - i], 0);
+        if (rc != hipSuccess && rc != hipErrorPeerAccessAlreadyEnabled) {
+            GGML_LOG_WARN("%s: hipDeviceEnablePeerAccess failed (%s), P2P AllReduce disabled\n",
+                          __func__, hipGetErrorString(rc));
+            (void) hipGetLastError();
+            return false;
+        }
+        (void) hipGetLastError();
+    }
+
+    const size_t recv_bytes    = (size_t) GGML_CUDA_AR_POOL_SIZE * p->buf_bytes;
+    const size_t arrival_bytes = ggml_cuda_ar_p2p_arrival_bytes();
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        if (hipExtMallocWithFlags(reinterpret_cast<void **>(&p->p2p_recv[i]),    recv_bytes,    hipDeviceMallocUncached) != hipSuccess ||
+            hipExtMallocWithFlags(reinterpret_cast<void **>(&p->p2p_arrival[i]), arrival_bytes, hipDeviceMallocUncached) != hipSuccess) {
+            GGML_LOG_WARN("%s: uncached device alloc failed, P2P AllReduce disabled\n", __func__);
+            (void) hipGetLastError();
+            return false;
+        }
+        CUDA_CHECK(cudaMemset(p->p2p_arrival[i], 0, arrival_bytes));
+    }
+
+    GGML_LOG_INFO("%s: using P2P AllReduce for the chunked kernel path\n", __func__);
+    return true;
+}
+#endif // GGML_USE_HIP
+
+static void ggml_cuda_ar_p2p_free(ggml_cuda_ar_pipeline * p) {
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        if (p->p2p_recv[i] || p->p2p_arrival[i]) {
+            ggml_cuda_set_device(p->devices[i]);
+        }
+        if (p->p2p_recv[i]) {
+            CUDA_CHECK(cudaFree(p->p2p_recv[i]));
+            p->p2p_recv[i] = nullptr;
+        }
+        if (p->p2p_arrival[i]) {
+            CUDA_CHECK(cudaFree(p->p2p_arrival[i]));
+            p->p2p_arrival[i] = nullptr;
+        }
+    }
+    p->p2p = false;
+}
 
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
 // blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally to land on its own slot.
@@ -532,6 +608,13 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+#ifdef GGML_USE_HIP
+    p->p2p = ggml_cuda_ar_p2p_init(p);
+    if (!p->p2p) {
+        ggml_cuda_ar_p2p_free(p);
+    }
+#endif // GGML_USE_HIP
+
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
                   "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
                   __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
@@ -582,6 +665,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
         }
     }
     p->arrival.free();
+    ggml_cuda_ar_p2p_free(p);
     delete p;
 }
 
@@ -921,15 +1005,21 @@ bool ggml_cuda_ar_allreduce(
                     CUDA_CHECK(cudaMemsetAsync(data, 0, chunk_dst_bytes, stream));
                 }
 
+                // P2P: write into the peer VRAM, read and poll the local VRAM.
+                char * send_buf  = p->p2p ? p->p2p_recv[peer] : (char *) p->host_buf[i].dev;
+                char * recv_buf  = p->p2p ? p->p2p_recv[i]    : (char *) p->host_buf[peer].dev;
+                int *  arrive_me = p->p2p ? ggml_cuda_ar_p2p_arrival_ptr(p, slot, peer) : ggml_cuda_ar_arrival_ptr(p, slot, i);
+                int *  arrive_pe = p->p2p ? ggml_cuda_ar_p2p_arrival_ptr(p, slot, i)    : ggml_cuda_ar_arrival_ptr(p, slot, peer);
+
 #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
                 ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
                     reinterpret_cast<const T_dst *>(data), \
                     reinterpret_cast<T_dst *>(data), \
-                    reinterpret_cast<T_wire *>(p->host_buf[i].dev + (size_t) slot * p->buf_bytes), \
-                    reinterpret_cast<const T_wire *>(p->host_buf[peer].dev + (size_t) slot * p->buf_bytes), \
+                    reinterpret_cast<T_wire *>(send_buf + (size_t) slot * p->buf_bytes), \
+                    reinterpret_cast<const T_wire *>(recv_buf + (size_t) slot * p->buf_bytes), \
                     static_cast<int>(chunk_elems), \
-                    ggml_cuda_ar_arrival_ptr(p, slot, i), \
-                    ggml_cuda_ar_arrival_ptr(p, slot, peer), \
+                    arrive_me, \
+                    arrive_pe, \
                     token)
 
                 if (use_bf16) {

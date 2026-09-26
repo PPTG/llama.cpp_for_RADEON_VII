@@ -22,4 +22,4 @@ cmake -S . -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     "$@"
 
-cmake --build "${BUILD_DIR}" --config Release -j"$(nproc)" --target llama-bench llama-cli llama-server test-backend-ops
+cmake --build "${BUILD_DIR}" --config Release -j"$(nproc)" --target llama-bench llama-cli llama-server llama-completion test-backend-ops
