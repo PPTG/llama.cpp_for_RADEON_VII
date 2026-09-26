@@ -7254,6 +7254,79 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// mul_mat(_id) with merged gate_up weights, split into gate and up by 2 views, then glu (e.g. Gemma 4 ffn_gate_up_exps)
+struct test_mul_mat_vec_fusion_merged : public test_case {
+    const ggml_type   type;
+    const ggml_glu_op glu_op;
+    const int64_t     m;      // tokens
+    const int64_t     n;      // n_ff
+    const int64_t     k;
+    const bool        use_id;
+    const int         n_mats;
+    const int         n_used;
+    const bool        gate_first;
+
+    test_mul_mat_vec_fusion_merged(ggml_type type, ggml_glu_op glu_op, int64_t m, int64_t n, int64_t k,
+            bool use_id, int n_mats = 16, int n_used = 8, bool gate_first = true)
+        : type(type), glu_op(glu_op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), gate_first(gate_first) {}
+
+    std::string vars() override {
+        return VARS_TO_STR9(type, glu_op, m, n, k, use_id, n_mats, n_used, gate_first);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_FUSION_MERGED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up;
+        if (use_id) {
+            ggml_tensor * w   = ggml_new_tensor_3d(ctx, type, k, 2*n, n_mats);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
+            if (n_used != n_mats) {
+                ids = ggml_view_2d(ctx, ids, n_used, m, ids->nb[1], 0);
+            }
+            ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, m);
+            gate_up = ggml_mul_mat_id(ctx, w, cur, ids);
+        } else {
+            ggml_tensor * w   = ggml_new_tensor_2d(ctx, type, k, 2*n);
+            ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+            gate_up = ggml_mul_mat(ctx, w, cur);
+        }
+
+        const size_t off_gate = gate_first ? 0 : n*gate_up->nb[0];
+        const size_t off_up   = gate_first ? n*gate_up->nb[0] : 0;
+        ggml_tensor * gate = ggml_view_3d(ctx, gate_up, n, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], off_gate);
+        ggml_tensor * up   = ggml_view_3d(ctx, gate_up, n, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], off_up);
+
+        ggml_tensor * out = ggml_glu_split(ctx, gate, up, glu_op);
+
+        std::array<int64_t, 4> scale_ne { 1, out->ne[1], out->ne[2], out->ne[3] };
+        ggml_tensor * scale = ggml_new_tensor(ctx, out->type, 4, scale_ne.data());
+        out = ggml_mul(ctx, out, scale);
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        if (!use_id) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+                init_tensor_uniform(t);
+            }
+        } else {
+            init_mul_mat_id_tensors(ctx, n_mats);
+        }
+    }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -11121,6 +11194,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL }) {
+        for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
+            for (bool use_id : { false, true }) {
+                for (bool gate_first : { true, false }) {
+                    for (int64_t m_batch : { 1, 3 }) {
+                        test_cases.emplace_back(new test_mul_mat_vec_fusion_merged(type, glu_op, m_batch, 64, 256, use_id, 16, 8, gate_first));
+                    }
+                }
+            }
+        }
     }
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.

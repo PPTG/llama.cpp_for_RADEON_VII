@@ -3524,6 +3524,58 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// Match mul_mat(_id) with merged gate_up weights -> view gate half -> view up half -> glu. Returns the node count or 0.
+static int ggml_cuda_match_merged_gate_up_glu(const ggml_cgraph * cgraph, const int i) {
+    if (i + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * mm  = cgraph->nodes[i];
+    const ggml_tensor * glu = cgraph->nodes[i + 3];
+    if ((mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID) || glu->op != GGML_OP_GLU) {
+        return 0;
+    }
+
+    const ggml_op ops[4] = { mm->op, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU };
+    const int     out[1] = { i + 3 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 4, ops, out, 1)) {
+        return 0;
+    }
+
+    static constexpr std::array<ggml_glu_op, 4> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP };
+    if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end() ||
+            ggml_get_op_params_i32(glu, 1) != 0) { // swapped
+        return 0;
+    }
+
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    const ggml_tensor * src0 = mm->src[0];
+    if (!gate || !up || gate == up || gate->view_src != mm || up->view_src != mm ||
+            (gate != cgraph->nodes[i + 1] && gate != cgraph->nodes[i + 2]) ||
+            (up   != cgraph->nodes[i + 1] && up   != cgraph->nodes[i + 2])) {
+        return 0;
+    }
+
+    const int64_t n_ff = mm->ne[0] / 2;
+    if (mm->ne[0] % 2 != 0 || !ggml_is_contiguous(mm) || !ggml_is_quantized(src0->type) || src0->ne[1] != mm->ne[0]) {
+        return 0;
+    }
+    for (const ggml_tensor * v : { gate, up }) {
+        if (v->ne[0] != n_ff || v->ne[1] != mm->ne[1] || v->ne[2] != mm->ne[2] || v->ne[3] != mm->ne[3] ||
+                v->nb[1] != mm->nb[1] || v->nb[2] != mm->nb[2] || v->nb[3] != mm->nb[3]) {
+            return 0;
+        }
+    }
+    const size_t half = n_ff * mm->nb[0];
+    if (!((gate->view_offs == 0 && up->view_offs == half) || (gate->view_offs == half && up->view_offs == 0))) {
+        return 0;
+    }
+    if (!ggml_is_contiguous(glu) || glu->ne[0] != n_ff) {
+        return 0;
+    }
+    return 4;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4074,6 +4126,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // merged gate_up weights (gate and up rows in one tensor, e.g. ffn_gate_up_exps) + 2 views + glu:
+    // run MMVQ with 2 views of the weights, one per half, and apply the glu in the same kernel.
+    if (const int n_gu = ggml_cuda_match_merged_gate_up_glu(cgraph, i); n_gu > 0) {
+        ggml_tensor *       mm   = cgraph->nodes[i];
+        ggml_tensor *       glu  = cgraph->nodes[i + n_gu - 1];
+        const ggml_tensor * src0 = mm->src[0];
+        const int64_t       n_ff = mm->ne[0] / 2;
+        const int out_gu[] = { i + n_gu - 1 };
+
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_gu, out_gu, 1) && ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
+            const int64_t gate_row0 = (int64_t) (glu->src[0]->view_offs / mm->nb[0]);
+            const int64_t up_row0   = (int64_t) (glu->src[1]->view_offs / mm->nb[0]);
+
+            ggml_tensor src0_up   = *src0;
+            ggml_tensor src0_gate = *src0;
+            src0_up.ne[1]   = n_ff;
+            src0_gate.ne[1] = n_ff;
+            src0_up.data    = (char *) src0->data + up_row0   * src0->nb[1];
+            src0_gate.data  = (char *) src0->data + gate_row0 * src0->nb[1];
+            src0_up.view_src   = nullptr;
+            src0_gate.view_src = nullptr;
+
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.gate      = &src0_gate;
+            fusion_data.glu_op    = ggml_get_glu_op(glu);
+            fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
+
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_up, mm->src[1], mm->src[2], glu, &fusion_data);
+            return n_gu - 1;
+        }
     }
 
     fused_mul_mat_vec = false;
@@ -4636,6 +4720,27 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
                 }
                 i += match.node_count - 1;
+            }
+
+            // mul_mat(_id) + glu fusions: keep src1 (and ids) alive until the glu output is allocated,
+            // else the glu output can reuse the memory of src1 and the fusion memory check rejects the fusion.
+            {
+                const ggml_tensor * node = cgraph->nodes[i];
+                const bool is_mm = node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID;
+                int glu_idx = -1;
+                if (is_mm && ggml_cuda_match_merged_gate_up_glu(cgraph, i) > 0) {
+                    glu_idx = i + 3;
+                } else if (is_mm && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == node->op &&
+                        cgraph->nodes[i + 2]->op == GGML_OP_GLU && cgraph->nodes[i + 1]->src[1] == node->src[1]) {
+                    glu_idx = i + 2;
+                }
+                if (glu_idx >= 0) {
+                    ggml_tensor * glu = cgraph->nodes[glu_idx];
+                    params->add_alloc_dep(params->user_data, node->src[1], glu);
+                    if (node->src[2]) {
+                        params->add_alloc_dep(params->user_data, node->src[2], glu);
+                    }
+                }
             }
 
             if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
