@@ -10,6 +10,7 @@ MODEL=${1:-models/gemma-4-26B-A4B-it-qat-uncensored-heretic-UDmerge-Q4_K_XL.gguf
 BUILD_DIR=${2:-build-dpp}
 SM=${3:-layer}
 BIN=${BUILD_DIR}/bin
+MMVQ_VARIANTS=${MMVQ_VARIANTS:-"1 2 3 4 5 6 7 8 9 10 11"}
 
 bench() {
     env "$@" "${BIN}/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -sm "${SM}" -p 0 -n 128 -r 5 -o csv 2>/dev/null \
@@ -17,7 +18,7 @@ bench() {
 }
 
 echo "=== correctness of the MMVQ variants vs CPU (MUL_MAT, MUL_MAT_ID)"
-for V in 1 2 3 4 5 6 7 8; do
+for V in ${MMVQ_VARIANTS}; do
     R1=$(GGML_HIP_MMVQ_VARIANT=$V "${BIN}/test-backend-ops" -b ROCm0 -o MUL_MAT    2>&1 | grep -E "tests passed" | tail -n 1)
     R2=$(GGML_HIP_MMVQ_VARIANT=$V "${BIN}/test-backend-ops" -b ROCm0 -o MUL_MAT_ID 2>&1 | grep -E "tests passed" | tail -n 1)
     echo "variant ${V}: MUL_MAT ${R1} | MUL_MAT_ID ${R2}"
@@ -25,9 +26,10 @@ done
 
 echo
 echo "=== tg128 t/s, split mode ${SM}"
-echo "Q8 cache off, default kernel: $(bench GGML_CUDA_MMVQ_Q8_CACHE=0)"
-echo "Q8 cache on,  default kernel: $(bench)"
-for V in 1 2 3 4 5 6 7 8; do
+echo "Q8 cache off, upstream kernel:   $(bench GGML_CUDA_MMVQ_Q8_CACHE=0 GGML_HIP_MMVQ_VARIANT=0)"
+echo "Q8 cache on,  upstream kernel:   $(bench GGML_HIP_MMVQ_VARIANT=0)"
+echo "Q8 cache on,  default (tuned):   $(bench)"
+for V in ${MMVQ_VARIANTS}; do
     echo "Q8 cache on,  variant ${V}:     $(bench GGML_HIP_MMVQ_VARIANT=$V)"
 done
 

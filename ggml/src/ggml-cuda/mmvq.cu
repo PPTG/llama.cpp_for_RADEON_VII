@@ -607,15 +607,18 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 
 // Tuning variants for ncols_dst == 1 on HIP, picked at runtime with GGML_HIP_MMVQ_VARIANT=<n> (0 = default heuristics).
 // Each variant fixes nwarps (warps per block) and rows per block. More rows per warp = more loads in flight per thread.
-static constexpr int MMVQ_N_VARIANTS = 8;
+static constexpr int MMVQ_N_VARIANTS = 11;
 static constexpr __host__ __device__ int mmvq_variant_nwarps(int variant) {
-    constexpr int nwarps[MMVQ_N_VARIANTS + 1] = {0, 1, 1, 1, 2, 2, 4, 4, 1};
+    constexpr int nwarps[MMVQ_N_VARIANTS + 1] = {0, 1, 1, 1, 2, 2, 4, 4, 1, 1, 2, 2};
     return nwarps[variant];
 }
 static constexpr __host__ __device__ int mmvq_variant_rows(int variant) {
-    constexpr int rows[MMVQ_N_VARIANTS + 1] = {0, 1, 2, 4, 1, 2, 1, 2, 8};
+    constexpr int rows[MMVQ_N_VARIANTS + 1] = {0, 1, 2, 4, 1, 2, 1, 2, 8, 16, 4, 8};
     return rows[variant];
 }
+
+// Default variant on GCN (gfx906): 1 warp, 8 rows, +10% tg vs the upstream heuristics on Radeon Pro VII.
+static constexpr int MMVQ_GCN_DEFAULT_VARIANT = 8;
 static constexpr __host__ __device__ bool mmvq_variant_type_supported(ggml_type type) {
 #ifdef GGML_USE_HIP
     switch (type) {
@@ -1250,11 +1253,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
             };
 
             if constexpr (mmvq_variant_type_supported(type)) {
-                static const int variant = [] {
+                static const int variant_env = [] {
                     const char * env = getenv("GGML_HIP_MMVQ_VARIANT");
-                    const int v = env ? atoi(env) : 0;
-                    return v >= 0 && v <= MMVQ_N_VARIANTS ? v : 0;
+                    const int v = env ? atoi(env) : -1;
+                    return v >= -1 && v <= MMVQ_N_VARIANTS ? v : -1;
                 }();
+                // unset: tuned default on GCN, upstream heuristics elsewhere; 0: always upstream heuristics
+                const int variant = variant_env >= 0 ? variant_env : (GGML_CUDA_CC_IS_GCN(cc) ? MMVQ_GCN_DEFAULT_VARIANT : 0);
                 if (variant > 0 && nrows_x % mmvq_variant_rows(variant) == 0) {
                     const auto launch_variant = [&](auto variant_tag) {
                         constexpr int c_variant = decltype(variant_tag)::value;
@@ -1275,6 +1280,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
                         case 6: launch_variant(std::integral_constant<int, 6>{}); break;
                         case 7: launch_variant(std::integral_constant<int, 7>{}); break;
                         case 8: launch_variant(std::integral_constant<int, 8>{}); break;
+                        case 9: launch_variant(std::integral_constant<int, 9>{}); break;
+                        case 10: launch_variant(std::integral_constant<int, 10>{}); break;
+                        case 11: launch_variant(std::integral_constant<int, 11>{}); break;
                         default: GGML_ABORT("fatal error");
                     }
                     break;
