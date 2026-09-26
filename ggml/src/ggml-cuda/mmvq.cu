@@ -1503,6 +1503,22 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// GGML_CUDA_MMVQ_Q8_CACHE=0/1: quantize src1 once for consecutive MMVQ ops with the same src1. Default on for HIP.
+static bool ggml_cuda_mmvq_use_q8_cache() {
+    static const bool use = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_Q8_CACHE");
+        if (env != nullptr) {
+            return atoi(env) == 1;
+        }
+#ifdef GGML_USE_HIP
+        return true;
+#else
+        return false;
+#endif // GGML_USE_HIP
+    }();
+    return use;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1583,12 +1599,47 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // Reuse the Q8_1 data if the previous MMVQ in this graph compute quantized the same src1.
+    // src1 is still used by this op, so its data can not have been overwritten in between.
+    ggml_cuda_mmvq_q8_cache & q8_cache = ctx.mmvq_q8_cache;
+    bool use_q8_cache = ggml_cuda_mmvq_use_q8_cache() && ids == nullptr;
+    if (use_q8_cache && q8_cache.size < q8_1_size) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (q8_cache.buf != nullptr) {
+                CUDA_CHECK(cudaFree(q8_cache.buf));
+            }
+            q8_cache.size = std::max(q8_1_size, (size_t) 64*1024);
+            CUDA_CHECK(cudaMalloc(&q8_cache.buf, q8_cache.size));
+            q8_cache.reset();
+        } else {
+            use_q8_cache = false;
+        }
+    }
+
+    const bool q8_cache_hit = use_q8_cache && q8_cache.src1 == src1 && q8_cache.data == src1->data && q8_cache.stream == stream &&
+        memcmp(q8_cache.ne, src1->ne, sizeof(q8_cache.ne)) == 0 && memcmp(q8_cache.nb, src1->nb, sizeof(q8_cache.nb)) == 0;
+
+    ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
+    char * src1_q8_1_ptr = use_q8_cache ? (char *) q8_cache.buf : src1_q8_1_pool.alloc(q8_1_size);
+
+    if (!q8_cache_hit) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+
+        if (use_q8_cache) {
+            q8_cache.src1   = src1;
+            q8_cache.data   = src1->data;
+            q8_cache.stream = stream;
+            memcpy(q8_cache.ne, src1->ne, sizeof(q8_cache.ne));
+            memcpy(q8_cache.nb, src1->nb, sizeof(q8_cache.nb));
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1614,7 +1665,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

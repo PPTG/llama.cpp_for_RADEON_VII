@@ -1532,6 +1532,23 @@ struct ggml_cuda_staged_copy_slot {
 
 static constexpr int GGML_CUDA_STAGED_COPY_SLOTS = 8;
 
+// Q8_1 copy of the last src1 quantized by MMVQ. Q, K, V (and gate, up) use the same src1, so it is quantized once.
+// Only valid within one graph compute: it is reset at the start of each graph compute.
+struct ggml_cuda_mmvq_q8_cache {
+    const ggml_tensor * src1   = nullptr;
+    const void *        data   = nullptr;
+    cudaStream_t        stream = nullptr;
+    int64_t             ne[GGML_MAX_DIMS] = {0};
+    size_t              nb[GGML_MAX_DIMS] = {0};
+    void *              buf    = nullptr;
+    size_t              size   = 0;
+
+    void reset() {
+        src1 = nullptr;
+        data = nullptr;
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1539,6 +1556,8 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_staged_copy_slot staged_copy_slots[GGML_CUDA_STAGED_COPY_SLOTS];
     int staged_copy_next = 0;
+
+    ggml_cuda_mmvq_q8_cache mmvq_q8_cache;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

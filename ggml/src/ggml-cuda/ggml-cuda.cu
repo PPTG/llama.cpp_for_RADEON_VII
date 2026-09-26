@@ -700,6 +700,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (mmvq_q8_cache.buf != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(mmvq_q8_cache.buf));
+    }
     for (ggml_cuda_staged_copy_slot & slot : staged_copy_slots) {
         if (slot.h2d_done != nullptr) {
             CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
@@ -4518,6 +4522,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // tensor data may change between graph computes
+    cuda_ctx->mmvq_q8_cache.reset();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
