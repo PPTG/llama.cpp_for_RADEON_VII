@@ -373,6 +373,57 @@ static constexpr __device__ int ggml_cuda_fattn_tile_get_nbatch_K(const int DKQ,
     return (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols) >> 23) & ((1 << 9) - 1);
 }
 
+// Tuning variants of the tile kernel that reads a q8_0 K/V cache (GGML_CUDA_FA_Q8_CFG=<n>), for the token generation
+// shapes of Gemma 4: head size 512 with GQA 8 (8 columns) and head size 256 with GQA 2 (2 columns). 0 or a variant that
+// is not defined here use the normal config. Packed as in GGML_CUDA_FATTN_TILE_CONFIG_CASE.
+#define GGML_CUDA_FATTN_TILE_Q8_CFG(nthreads, occupancy, nbatch_fa, nbatch_K) \
+    (((nthreads) << 0) | ((occupancy) << 10) | ((nbatch_fa) << 14) | ((nbatch_K) << 23))
+
+static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_q8_config(const int DKQ, const int ncols, const int cfg) {
+    if (DKQ == 512 && ncols == 8) {
+        switch (cfg) {
+            case 1: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2, 128,  64);
+            case 2: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2,  64, 128);
+            case 3: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 3,  64,  64);
+            case 4: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2, 128, 128);
+            case 5: return GGML_CUDA_FATTN_TILE_Q8_CFG(128, 4,  64,  64);
+            default: return 0;
+        }
+    }
+    if (DKQ == 256 && ncols == 2) {
+        switch (cfg) {
+            case 1: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2, 256,  64);
+            case 2: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2, 128, 128);
+            case 3: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 3, 128,  64);
+            case 4: return GGML_CUDA_FATTN_TILE_Q8_CFG(128, 4,  64,  64);
+            case 5: return GGML_CUDA_FATTN_TILE_Q8_CFG(128, 4, 128,  64);
+            default: return 0;
+        }
+    }
+    return 0;
+}
+
+// variant that is actually used: cfg if it is defined for this shape, else 0
+static constexpr __host__ __device__ int ggml_cuda_fattn_tile_q8_cfg_eff(const int DKQ, const int ncols, const int cfg) {
+    return ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg) != 0 ? cfg : 0;
+}
+
+static constexpr __device__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols, const int cfg, int) {
+    return cfg != 0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols);
+}
+
+static __host__ uint32_t ggml_cuda_fattn_tile_get_config_cfg(const int DKQ, const int DV, const int ncols, const int cfg, const int cc) {
+    return cfg != 0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols, cc);
+}
+
+static int ggml_cuda_fattn_tile_q8_cfg_env() {
+    static const int cfg = [] {
+        const char * env = getenv("GGML_CUDA_FA_Q8_CFG");
+        return env == nullptr ? 0 : atoi(env);
+    }();
+    return cfg;
+}
+
 // TODO: deduplicate with mma-f16
 template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
 static __device__ __forceinline__ void flash_attn_tile_load_tile(
@@ -891,8 +942,11 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 }
 
 // type_KV: F16, or Q8_0 to read a q8_0 K/V cache directly (DKQ == DV, 256 or 512 only)
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_KV = GGML_TYPE_F16> // D == head size
-__launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
+// cfg: tuning variant for type_KV == Q8_0 (see ggml_cuda_fattn_tile_q8_config), 0 = normal config
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_KV = GGML_TYPE_F16, int cfg = 0> // D == head size
+__launch_bounds__(
+    (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols1*ncols2, cfg, 0) >>  0) & ((1 << 10) - 1),
+    (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols1*ncols2, cfg, 0) >> 10) & ((1 <<  4) - 1))
 static __global__ void flash_attn_tile(
         const char * Q_ptr,
         const char * K_ptr,
@@ -942,13 +996,14 @@ static __global__ void flash_attn_tile(
         return;
     }
 
-    static_assert(ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols1*ncols2) != 0, "kernel config not defined");
+    constexpr uint32_t tile_config = ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols1*ncols2, cfg, 0);
+    static_assert(tile_config != 0, "kernel config not defined");
 
     constexpr int ncols     = ncols1*ncols2;
     constexpr int warp_size = 32;
-    constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
-    constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
-    constexpr int nbatch_K  = ggml_cuda_fattn_tile_get_nbatch_K (DKQ, DV, ncols1*ncols2);
+    constexpr int nwarps    = ((tile_config >>  0) & ((1 << 10) - 1)) / warp_size;
+    constexpr int nbatch_fa =  (tile_config >> 14) & ((1 <<  9) - 1);
+    constexpr int nbatch_K  =  (tile_config >> 23) & ((1 <<  9) - 1);
 
     // In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1277,13 +1332,31 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         if (ggml_cuda_fattn_tile_q8_enabled() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
                 Q->ne[1]*ncols2 <= 8 && strides_ok) {
             // same number of columns per block as the f16 path below, so the results are the same
-            auto launch_q8 = [&](auto cols_per_block_c) {
+            auto launch_q8_cfg = [&](auto cols_per_block_c, auto cfg_c) {
                 constexpr int cols_per_block = decltype(cols_per_block_c)::value;
-                const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
-                const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
-                fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, GGML_TYPE_Q8_0>;
+                constexpr int cfg            = decltype(cfg_c)::value;
+                const uint32_t config = ggml_cuda_fattn_tile_get_config_cfg(DKQ, DV, cols_per_block, cfg, cc);
+                const int nwarps    = ((config >>  0) & ((1 << 10) - 1)) / warp_size;
+                const int nbatch_fa =  (config >> 14) & ((1 <<  9) - 1);
+                fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, GGML_TYPE_Q8_0, cfg>;
                 launch_fattn<DV, cols_per_block/ncols2, ncols2>
                     (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, false, false, false, false, warp_size);
+            };
+            // tuning variants only for the columns of the Gemma 4 shapes (GQA 8 for head 512, GQA 2 for head 256)
+            auto launch_q8 = [&](auto cols_per_block_c) {
+                constexpr int cols_per_block = decltype(cols_per_block_c)::value;
+                constexpr bool tunable = cols_per_block == ncols2 && ggml_cuda_fattn_tile_q8_config(DKQ, cols_per_block, 1) != 0;
+                if constexpr (tunable) {
+                    switch (ggml_cuda_fattn_tile_q8_cfg_env()) {
+                        case 1: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 1)>{}); return;
+                        case 2: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 2)>{}); return;
+                        case 3: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 3)>{}); return;
+                        case 4: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 4)>{}); return;
+                        case 5: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 5)>{}); return;
+                        default: break;
+                    }
+                }
+                launch_q8_cfg(cols_per_block_c, std::integral_constant<int, 0>{});
             };
             if constexpr (ncols2 <= 2) {
                 if (Q->ne[1] <= 2/ncols2) {
