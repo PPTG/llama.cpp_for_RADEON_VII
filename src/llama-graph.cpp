@@ -2777,31 +2777,39 @@ ggml_tensor * llm_graph_context::build_attn_split_heads(
     GGML_ASSERT(kq_b == nullptr && sinks == nullptr && v_mla == nullptr && "LLAMA_KV_SPLIT_HEADS: not supported for this model");
     GGML_ASSERT(cparams.flash_attn && "LLAMA_KV_SPLIT_HEADS needs flash attention");
 
-    ggml_backend_t backend_1 = llama_graph_backend_of_buffer(sched, mctx_cur->get_k2_storage(il)->buffer);
-
-    // store
-    for (int part = 0; part < 2; ++part) {
-        if (k_cur) {
-            ggml_tensor * t = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il, part);
-            if (part == 1 && backend_1) {
-                ggml_backend_sched_set_tensor_backend(sched, t, backend_1);
-            }
-            ggml_build_forward_expand(gf, t);
-        }
-        if (v_cur) {
-            ggml_tensor * t = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il, part);
-            if (part == 1 && backend_1) {
-                ggml_backend_sched_set_tensor_backend(sched, t, backend_1);
-            }
-            ggml_build_forward_expand(gf, t);
-        }
-    }
-
     // attention per part, the Q heads of the first KV heads go with the first part
     ggml_tensor * k0 = mctx_cur->get_k(ctx0, il, 0);
     ggml_tensor * k1 = mctx_cur->get_k(ctx0, il, 1);
     ggml_tensor * v0 = mctx_cur->get_v(ctx0, il, 0);
     ggml_tensor * v1 = mctx_cur->get_v(ctx0, il, 1);
+
+    // every op of a part is pinned to the device of its KV cache: an op without a pinned backend gets the backend of
+    // the previous node in the graph, which could pull the whole KV cache of the other part over PCIe
+    ggml_backend_t backends[2] = {
+        llama_graph_backend_of_buffer(sched, k0->view_src ? k0->view_src->buffer : k0->buffer),
+        llama_graph_backend_of_buffer(sched, k1->view_src ? k1->view_src->buffer : k1->buffer),
+    };
+    auto pin = [&](ggml_tensor * t, int part) {
+        if (backends[part]) {
+            ggml_backend_sched_set_tensor_backend(sched, t, backends[part]);
+        }
+    };
+
+    // the second part (other device) goes first in the graph: its inputs are copied to the other device as soon as Q, K
+    // and V are ready, and its attention runs while the first part is computed on the device of the layer
+    // store
+    for (int part = 1; part >= 0; --part) {
+        if (k_cur) {
+            ggml_tensor * t = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il, part);
+            pin(t, part);
+            ggml_build_forward_expand(gf, t);
+        }
+        if (v_cur) {
+            ggml_tensor * t = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il, part);
+            pin(t, part);
+            ggml_build_forward_expand(gf, t);
+        }
+    }
 
     const int64_t n_head_kv = k0->ne[1] + k1->ne[1];
     GGML_ASSERT(q->ne[1] % n_head_kv == 0);
@@ -2810,21 +2818,24 @@ ggml_tensor * llm_graph_context::build_attn_split_heads(
     ggml_tensor * q0 = ggml_view_3d(ctx0, q, q->ne[0], n_q0,            q->ne[2], q->nb[1], q->nb[2], 0);
     ggml_tensor * q1 = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1] - n_q0, q->ne[2], q->nb[1], q->nb[2], n_q0*q->nb[1]);
 
-    ggml_tensor * cur0 = build_attn_mha(q0, k0, v0, nullptr, kq_mask, nullptr, nullptr, 0, kq_scale, il);
     ggml_tensor * cur1 = build_attn_mha(q1, k1, v1, nullptr, kq_mask, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * cur0 = build_attn_mha(q0, k0, v0, nullptr, kq_mask, nullptr, nullptr, 0, kq_scale, il);
 
-    if (backend_1) {
-        // the attention of the second part runs on the device of its KV cache
-        ggml_tensor * fa = cur1;
+    ggml_tensor * curs[2] = { cur0, cur1 };
+    for (int part = 0; part < 2; ++part) {
+        ggml_tensor * fa = curs[part];
         while (fa && fa->op != GGML_OP_FLASH_ATTN_EXT) {
             fa = fa->view_src ? fa->view_src : fa->src[0];
         }
         GGML_ASSERT(fa != nullptr);
-        ggml_backend_sched_set_tensor_backend(sched, fa, backend_1);
+        pin(fa, part);
     }
+    ggml_build_forward_expand(gf, cur1);
+    ggml_build_forward_expand(gf, cur0);
 
-    // [n_embd_head_v*n_head_q, n_tokens]
+    // [n_embd_head_v*n_head_q, n_tokens], on the device of the layer
     ggml_tensor * cur = ggml_concat(ctx0, cur0, cur1, 0);
+    pin(cur, 0);
     ggml_build_forward_expand(gf, cur);
 
     return cur;
