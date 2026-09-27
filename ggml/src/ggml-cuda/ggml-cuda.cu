@@ -3669,6 +3669,36 @@ static bool ggml_cuda_fuse_norm_multi_enabled() {
     return enabled;
 }
 
+// GGML_CUDA_FUSE_FWHT=0/1: the Hadamard rotation of a quantized KV cache (fwht) runs in the kernel that consumes it:
+// fwht -> set_rows (K/V into a q8_0 cache) and fwht -> quantize q8_1 for the MMVQ of attn_output. graph_optimize moves
+// the set_rows right behind its fwht. Default on for HIP.
+static bool ggml_cuda_fuse_fwht_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_FWHT");
+        if (env != nullptr) {
+            return atoi(env) != 0;
+        }
+#ifdef GGML_USE_HIP
+        return true;
+#else
+        return false;
+#endif // GGML_USE_HIP
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_is_fwht_node(const ggml_tensor * node) {
+    return node->op == GGML_OP_MUL_MAT && ggml_cuda_op_mul_mat_use_fwht(node);
+}
+
+// Walks src[0] of RESHAPE/VIEW nodes from t, returns the first other tensor.
+static const ggml_tensor * ggml_cuda_view_chain_root(const ggml_tensor * t) {
+    while (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) {
+        t = t->src[0];
+    }
+    return t;
+}
+
 // rms_norm -> [scale ->] mul by a 1D weight at node idx, returns the chain length (2 or 3) or 0.
 static int ggml_cuda_match_rms_norm_chain(const ggml_cgraph * cgraph, const int idx) {
     if (idx + 1 >= cgraph->n_nodes) {
@@ -4384,6 +4414,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // fwht -> [reshape/view ->] set_rows (q8_0 KV cache) or mul_mat (MMVQ): one kernel for the transform and the store
+    if (ggml_cuda_fuse_fwht_enabled() && ggml_cuda_is_fwht_node(node)) {
+        constexpr int max_views = 6;
+        ggml_op ops[max_views + 2];
+        ops[0] = GGML_OP_MUL_MAT;
+        int j = i + 1;
+        while (j < cgraph->n_nodes && j - i <= max_views &&
+                (cgraph->nodes[j]->op == GGML_OP_RESHAPE || cgraph->nodes[j]->op == GGML_OP_VIEW)) {
+            ops[j - i] = cgraph->nodes[j]->op;
+            j++;
+        }
+        if (j < cgraph->n_nodes && j - i <= max_views) {
+            ggml_tensor * consumer = cgraph->nodes[j];
+            ops[j - i] = consumer->op;
+            const int n = j - i + 1;
+            if (consumer->op == GGML_OP_SET_ROWS && ggml_cuda_fwht_set_rows_supported(node, consumer) &&
+                    ggml_can_fuse_subgraph(cgraph, i, n, ops, &j, 1)) {
+                ggml_cuda_op_fwht_set_rows(*cuda_ctx, node, consumer);
+                return n - 1;
+            }
+            if (consumer->op == GGML_OP_MUL_MAT && ggml_is_quantized(consumer->src[0]->type) &&
+                    ggml_cuda_should_fuse_mul_mat_vec_q(consumer) &&
+                    ggml_cuda_fwht_quantize_q8_1_supported(node, consumer->src[1]) &&
+                    ggml_can_fuse_subgraph(cgraph, i, n, ops, &j, 1)) {
+                const ggml_tensor * src1 = consumer->src[1];
+                const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+                ggml_cuda_pool_alloc<char> q8(cuda_ctx->pool(), ggml_nrows(src1) * ne10_padded * sizeof(block_q8_1) / QK8_1);
+                ggml_cuda_fwht_quantize_q8_1(*cuda_ctx, node, src1, q8.get(), ne10_padded);
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, consumer->src[0], src1, nullptr, consumer, nullptr, q8.get());
+                return n - 1;
+            }
+        }
+    }
+
     // glu -> mul_mat(_id) (e.g. ffn_down): compute the glu and quantize it for MMVQ in one kernel
     if (node->op == GGML_OP_GLU && ggml_cuda_fuse_glu_q8_enabled() && i + 1 < cgraph->n_nodes) {
         ggml_tensor * mm = cgraph->nodes[i + 1];
@@ -5044,6 +5108,73 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 j = group_end - 1;
             }
             i = group_end - 1;
+        }
+    }
+
+    // Move a set_rows that stores the output of a fwht (Hadamard rotation of K/V for a quantized cache), together with
+    // its view nodes, right behind the fwht, so they can run as one kernel (see ggml_cuda_fuse_fwht_enabled). The nodes
+    // it jumps over must not touch the cache or compute the row indices.
+    if (!disable_fusion && ggml_cuda_fuse_fwht_enabled()) {
+        constexpr int max_lookahead = 32;
+        std::vector<ggml_tensor *> moved;
+        std::vector<ggml_tensor *> rest;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * fwht = cgraph->nodes[i];
+            if (!ggml_cuda_is_fwht_node(fwht)) {
+                continue;
+            }
+            int p = i + 1; // first node after the view chain of the fwht
+            while (p < cgraph->n_nodes && (cgraph->nodes[p]->op == GGML_OP_RESHAPE || cgraph->nodes[p]->op == GGML_OP_VIEW) &&
+                    cgraph->nodes[p]->src[0] == cgraph->nodes[p - 1]) {
+                p++;
+            }
+            for (int j = p; j < cgraph->n_nodes && j <= i + max_lookahead; ++j) {
+                ggml_tensor * sr = cgraph->nodes[j];
+                if (sr->op != GGML_OP_SET_ROWS || ggml_cuda_view_chain_root(sr->src[0]) != fwht) {
+                    continue;
+                }
+                if (j == p) {
+                    break;
+                }
+                const ggml_tensor * cache = sr->view_src ? sr->view_src : sr;
+                const ggml_tensor * idx   = sr->src[1];
+                moved.clear();
+                rest.clear();
+                bool ok = true;
+                for (int k = p; k < j && ok; ++k) {
+                    ggml_tensor * n = cgraph->nodes[k];
+                    bool in_chain = false;
+                    for (const ggml_tensor * t = sr->src[0]; t != fwht; t = t->src[0]) {
+                        in_chain = in_chain || t == n;
+                    }
+                    if (in_chain) {
+                        moved.push_back(n);
+                        continue;
+                    }
+                    if (n == idx || n == idx->view_src || (n->view_src ? n->view_src : n) == cache) {
+                        ok = false;
+                    }
+                    for (int s = 0; s < GGML_MAX_SRC && ok; ++s) {
+                        const ggml_tensor * src = n->src[s];
+                        if (src && (src->view_src ? src->view_src : src) == cache) {
+                            ok = false;
+                        }
+                    }
+                    rest.push_back(n);
+                }
+                if (ok) {
+                    moved.push_back(sr);
+                    int k = p;
+                    for (ggml_tensor * n : moved) {
+                        cgraph->nodes[k++] = n;
+                    }
+                    for (ggml_tensor * n : rest) {
+                        cgraph->nodes[k++] = n;
+                    }
+                    GGML_ASSERT(k == j + 1);
+                }
+                break;
+            }
         }
     }
 

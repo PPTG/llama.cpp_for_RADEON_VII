@@ -16,7 +16,7 @@ BIN=${BUILD_DIR}/bin
 
 if [ -z "${SKIP_TESTS:-}" ]; then
 echo "=== correctness vs CPU"
-for OP in MUL_MAT MUL_MAT_ID MUL_MAT_VEC_FUSION MUL_MAT_VEC_FUSION_MERGED MUL_MAT_MULTI GLU_MUL_MAT RMS_NORM_MULTI RMS_NORM_SCALE_MUL RMS_NORM_MUL_ADD MOE_REDUCE FLASH_ATTN_EXT; do
+for OP in MUL_MAT MUL_MAT_ID MUL_MAT_VEC_FUSION MUL_MAT_VEC_FUSION_MERGED MUL_MAT_MULTI GLU_MUL_MAT RMS_NORM_MULTI RMS_NORM_SCALE_MUL RMS_NORM_MUL_ADD MOE_REDUCE FWHT_FUSED FLASH_ATTN_EXT; do
     R=$("${BIN}/test-backend-ops" -b ROCm0 -o "${OP}" 2>&1 | tee "/tmp/check-${OP}.log" | grep -E "tests passed" | tail -n 1)
     echo "${OP}: ${R}"
     grep -m 5 "FAIL" "/tmp/check-${OP}.log"
@@ -56,6 +56,16 @@ else
     echo "DIFF q8_0 KV: FA tile q8_0 != f16 conversion"
     echo "--- conversion: $(echo "${Q8OLD}" | head -c 300)"
     echo "--- q8_0:       $(echo "${Q8NEW}" | head -c 300)"
+fi
+
+# q8_0 KV cache: the Hadamard rotation fused into the cache store / attn_output quantization must not change the text
+Q8FWHT=$(genq8 GGML_CUDA_FUSE_FWHT=0)
+if [ -n "${Q8NEW}" ] && [ "${Q8NEW}" == "${Q8FWHT}" ]; then
+    echo "OK   q8_0 KV: default == GGML_CUDA_FUSE_FWHT=0"
+else
+    echo "DIFF q8_0 KV: default != GGML_CUDA_FUSE_FWHT=0"
+    echo "--- GGML_CUDA_FUSE_FWHT=0: $(echo "${Q8FWHT}" | head -c 300)"
+    echo "--- default:               $(echo "${Q8NEW}" | head -c 300)"
 fi
 
 NOFUSE=$(gen GGML_CUDA_DISABLE_FUSION=1)

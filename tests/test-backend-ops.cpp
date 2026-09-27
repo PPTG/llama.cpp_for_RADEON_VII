@@ -3843,6 +3843,85 @@ struct test_glu_mul_mat : public test_case {
     }
 };
 
+// Hadamard rotation (mul_mat with GGML_HINT_SRC0_IS_HADAMARD) of K/V or of the attention output, followed by the
+// store into a quantized KV cache (set_rows) or by attn_output (mul_mat), fused into one kernel by some backends
+struct test_fwht_fused : public test_case {
+    const ggml_type type;     // cache type (set_rows) or weight type (mul_mat)
+    const bool      set_rows; // else mul_mat
+    const int64_t   n_rot;
+    const int64_t   head_dim;
+    const int64_t   n_head;
+    const int64_t   n_tokens;
+    const ggml_type type_idx;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FWHT_FUSED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, set_rows, n_rot, head_dim, n_head, n_tokens, type_idx);
+    }
+
+    test_fwht_fused(ggml_type type, bool set_rows, int64_t n_rot, int64_t head_dim, int64_t n_head, int64_t n_tokens,
+            ggml_type type_idx = GGML_TYPE_I64)
+        : type(type), set_rows(set_rows), n_rot(n_rot), head_dim(head_dim), n_head(n_head), n_tokens(n_tokens), type_idx(type_idx) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot, n_rot);
+        ggml_set_name(rot, "rot");
+
+        // same nodes as llama_mul_mat_hadamard
+        ggml_tensor * h = ggml_reshape_2d(ctx, x, n_rot, ggml_nelements(x)/n_rot);
+        h = ggml_mul_mat(ctx, rot, h);
+        ggml_mul_mat_set_hint(h, GGML_HINT_SRC0_IS_HADAMARD);
+        h = ggml_reshape_3d(ctx, h, head_dim, n_head, n_tokens);
+
+        ggml_tensor * out;
+        if (set_rows) {
+            // same nodes as llama_kv_cache::cpy_k
+            ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, head_dim*n_head, 4*n_tokens + 3);
+            ggml_tensor * idx   = ggml_new_tensor_1d(ctx, type_idx, n_tokens);
+            h   = ggml_view_2d(ctx, h, head_dim*n_head, n_tokens, h->nb[2], 0);
+            out = ggml_set_rows(ctx, cache, h, idx);
+        } else {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, head_dim*n_head, 256);
+            h   = ggml_reshape_2d(ctx, h, head_dim*n_head, n_tokens);
+            out = ggml_mul_mat(ctx, w, h);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "rot") == 0) {
+                const int64_t n = t->ne[0];
+                std::vector<float> data(n*n);
+                const float scale = 1.0f / sqrtf((float) n);
+                for (int64_t r = 0; r < n; r++) {
+                    for (int64_t i = 0; i < n; i++) {
+                        data[r*n + i] = (__builtin_popcountll(r & i) % 2 == 0) ? scale : -scale;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
+                init_set_rows_row_ids(t, 4*n_tokens + 3);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 // 2 or 3 consecutive mul_mat with the same src1 (Q, K, V), run as one MMVQ launch by some backends
 struct test_mul_mat_multi : public test_case {
     const ggml_type type;
@@ -10234,6 +10313,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F16, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
+    }
+
+    // Gemma 4 like: K rotation 256/512 on head 256/512, V and attention output rotation 64
+    for (int64_t n_tokens : { 1, 3 }) {
+        test_cases.emplace_back(new test_fwht_fused(GGML_TYPE_Q8_0, true, 256, 256, 8, n_tokens));
+        test_cases.emplace_back(new test_fwht_fused(GGML_TYPE_Q8_0, true, 512, 512, 2, n_tokens));
+        test_cases.emplace_back(new test_fwht_fused(GGML_TYPE_Q8_0, true,  64, 256, 8, n_tokens));
+        test_cases.emplace_back(new test_fwht_fused(GGML_TYPE_Q8_0, true, 128, 128, 4, n_tokens, GGML_TYPE_I32));
+        test_cases.emplace_back(new test_fwht_fused(GGML_TYPE_Q4_0, true,  64, 128, 4, n_tokens));
+        for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
+            test_cases.emplace_back(new test_fwht_fused(type, false,  64, 256, 16, n_tokens));
+            test_cases.emplace_back(new test_fwht_fused(type, false,  64, 512, 16, n_tokens));
+            test_cases.emplace_back(new test_fwht_fused(type, false, 256, 256,  3, n_tokens));
+        }
     }
 
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
