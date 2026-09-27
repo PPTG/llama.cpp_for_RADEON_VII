@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-q8-wave.cuh"
 
 // nbatch_fa == number of KQ rows to process per iteration
 // nbatch_K == number of K columns to load in parallel for KQ calculation
@@ -1468,6 +1469,16 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     const int warp_size = 32;
 
     constexpr size_t nbytes_shared = 0;
+
+#if defined(GGML_USE_HIP)
+    // q8_0 K/V cache, head size 512, GQA 8, token generation on 64 wide waves (GGML_CUDA_FA_Q8_WAVE=0 to disable)
+    if constexpr (DKQ == 512 && DV == 512 && ncols2 == 8) {
+        if (ggml_cuda_fattn_tile_q8_enabled() && ggml_cuda_fattn_q8_wave_supported(dst)) {
+            ggml_cuda_flash_attn_ext_q8_wave(ctx, dst);
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     // q8_0 K/V cache: read it directly instead of converting the whole cache to f16 on every call
     // (token generation, GGML_CUDA_FA_TILE_Q8=0 to disable)

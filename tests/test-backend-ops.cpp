@@ -11367,6 +11367,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // head size 512, GQA 8, q8_0 token generation (HIP flash_attn_q8_wave): sinks, softcap, model KV layout,
+    // 2 sequences, GQA 16, 1 KV head (LLAMA_KV_SPLIT_HEADS)
+    for (int kv : { 256, 1280 }) {
+        const ggml_type t = GGML_TYPE_Q8_0;
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, kv, 1, true, true,  0.0f,  0.0f, GGML_PREC_F32, t, t));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, kv, 1, true, false, 0.0f, 10.0f, GGML_PREC_F32, t, t));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, kv, 1, true, false, 0.0f,  0.0f, GGML_PREC_F32, t, t, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 2}, kv, 1, true, false, 0.0f,  0.0f, GGML_PREC_F32, t, t));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, 1, true, false, 0.0f,  0.0f, GGML_PREC_F32, t, t));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, kv, 1, true, false, 0.0f,  0.0f, GGML_PREC_F32, t, t));
+    }
+
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
     for (int kv : { 1024, 2048, }) {
@@ -11758,6 +11770,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 1536, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, perm));
             for (int kv : { 4096, 16384, 65536, 131072 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, perm));
+            }
+            // one KV head per GPU (LLAMA_KV_SPLIT_HEADS)
+            if (!model_layout) {
+                for (int kv : { 16384, 65536 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, perm));
+                }
             }
         }
     }

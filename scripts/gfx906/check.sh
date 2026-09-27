@@ -48,8 +48,9 @@ genq8() {
     env "$@" "${BIN}/llama-completion" -m "${MODEL}" -ngl 99 -fa on -sm none -ctk q8_0 -ctv q8_0 -no-cnv --temp 0 -n 64 \
         -p "${PROMPT}" --no-display-prompt 2>/dev/null
 }
-# the f16 conversion path uses the normal tile config, compare with the same config (GGML_CUDA_FA_Q8_CFG=0)
-Q8NEW=$(genq8 GGML_CUDA_FA_Q8_CFG=0)
+# the f16 conversion path uses the normal tile config, compare with the same config (GGML_CUDA_FA_Q8_CFG=0),
+# without the head 512 kernel that quantizes Q to int8 (GGML_CUDA_FA_Q8_WAVE=0)
+Q8NEW=$(genq8 GGML_CUDA_FA_Q8_CFG=0 GGML_CUDA_FA_Q8_WAVE=0)
 Q8OLD=$(genq8 GGML_CUDA_FA_Q8_CFG=0 GGML_CUDA_FA_TILE_Q8=0)
 if [ -n "${Q8NEW}" ] && [ "${Q8NEW}" == "${Q8OLD}" ]; then
     echo "OK   q8_0 KV: FA tile q8_0 == f16 conversion"
@@ -57,6 +58,17 @@ else
     echo "DIFF q8_0 KV: FA tile q8_0 != f16 conversion"
     echo "--- conversion: $(echo "${Q8OLD}" | head -c 300)"
     echo "--- q8_0:       $(echo "${Q8NEW}" | head -c 300)"
+fi
+
+# head 512 kernel with Q quantized to int8 (as the CPU does for a q8_0 K): small differences are possible
+Q8WAVE=$(genq8)
+Q8TILE=$(genq8 GGML_CUDA_FA_Q8_WAVE=0)
+if [ -n "${Q8WAVE}" ] && [ "${Q8WAVE}" == "${Q8TILE}" ]; then
+    echo "OK   q8_0 KV: default == GGML_CUDA_FA_Q8_WAVE=0"
+else
+    echo "INFO q8_0 KV: default != GGML_CUDA_FA_Q8_WAVE=0 (Q in int8 for head 512), first 200 chars:"
+    echo "--- GGML_CUDA_FA_Q8_WAVE=0: $(echo "${Q8TILE}" | head -c 200)"
+    echo "--- default:               $(echo "${Q8WAVE}" | head -c 200)"
 fi
 
 # q8_0 KV cache: the Hadamard rotation fused into the cache store / attn_output quantization must not change the text
