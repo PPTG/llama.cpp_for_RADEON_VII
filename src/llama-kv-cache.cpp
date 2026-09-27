@@ -2140,12 +2140,6 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    for (const auto & layer : layers) {
-        if (layer.k2) {
-            throw std::runtime_error("saving the KV cache state is not supported with LLAMA_KV_SPLIT_HEADS");
-        }
-    }
-
     GGML_UNUSED(flags);
 
     io.write(&n_stream, sizeof(n_stream));
@@ -2211,11 +2205,6 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    for (const auto & layer : layers) {
-        if (layer.k2) {
-            throw std::runtime_error("loading the KV cache state is not supported with LLAMA_KV_SPLIT_HEADS");
-        }
-    }
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
 }
 
@@ -2324,6 +2313,11 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
+// LLAMA_KV_SPLIT_HEADS: the rows of a range of cells are stored as the rows of the first part (heads [0, n_head_split))
+// followed by the rows of the second part. The row size in the header has this bit set, so that such a state is not
+// loaded into a cache without the split (or the other way round) by mistake.
+static constexpr uint64_t LLAMA_KV_SPLIT_ROW_FLAG = 1ull << 63;
+
 void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
     const auto & cells = v_cells[cr.strm];
 
@@ -2348,11 +2342,19 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
         // Write row size of key
         const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-        io.write(&k_size_row, sizeof(k_size_row));
+        const uint64_t k_size_row_w = layer.k2 ? (k_size_row | LLAMA_KV_SPLIT_ROW_FLAG) : k_size_row;
+        io.write(&k_size_row_w, sizeof(k_size_row_w));
 
         // Read each range of cells of k_size length and write out
         for (const auto & range : cr.data) {
             const size_t range_size = range.second - range.first;
+            if (layer.k2) {
+                const size_t row0 = ggml_row_size(k->type, k->ne[0]);
+                const size_t row1 = ggml_row_size(layer.k2->type, layer.k2->ne[0]);
+                io.write_tensor(k,         range.first * row0, range_size * row0);
+                io.write_tensor(layer.k2,  range.first * row1, range_size * row1);
+                continue;
+            }
             const size_t buf_size = range_size * k_size_row;
             io.write_tensor(k, range.first * k_size_row, buf_size);
         }
@@ -2375,11 +2377,19 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
             // Write row size of value
             const uint64_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
-            io.write(&v_size_row, sizeof(v_size_row));
+            const uint64_t v_size_row_w = layer.v2 ? (v_size_row | LLAMA_KV_SPLIT_ROW_FLAG) : v_size_row;
+            io.write(&v_size_row_w, sizeof(v_size_row_w));
 
             // Read each range of cells of v_size length and write out
             for (const auto & range : cr.data) {
                 const size_t range_size = range.second - range.first;
+                if (layer.v2) {
+                    const size_t row0 = ggml_row_size(v->type, v->ne[0]);
+                    const size_t row1 = ggml_row_size(layer.v2->type, layer.v2->ne[0]);
+                    io.write_tensor(v,         range.first * row0, range_size * row0);
+                    io.write_tensor(layer.v2,  range.first * row1, range_size * row1);
+                    continue;
+                }
                 const size_t buf_size = range_size * v_size_row;
                 io.write_tensor(v, range.first * v_size_row, buf_size);
             }
@@ -2664,12 +2674,22 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         uint64_t k_size_row_ref;
         io.read(&k_size_row_ref, sizeof(k_size_row_ref));
         const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-        if (k_size_row != k_size_row_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
+        const uint64_t k_size_row_exp = layer.k2 ? (k_size_row | LLAMA_KV_SPLIT_ROW_FLAG) : k_size_row;
+        if (k_size_row_exp != k_size_row_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d, LLAMA_KV_SPLIT_HEADS saved = %d, now = %d)\n",
+                    __func__, k_size_row, (size_t) (k_size_row_ref & ~LLAMA_KV_SPLIT_ROW_FLAG), il,
+                    (int) ((k_size_row_ref & LLAMA_KV_SPLIT_ROW_FLAG) != 0), (int) (layer.k2 != nullptr));
             return false;
         }
 
         for (const auto & r : runs) {
+            if (layer.k2) {
+                const size_t row0 = ggml_row_size(k->type, k->ne[0]);
+                const size_t row1 = ggml_row_size(layer.k2->type, layer.k2->ne[0]);
+                io.read_tensor(k,        (size_t) r.from * row0, (size_t) (r.to - r.from) * row0);
+                io.read_tensor(layer.k2, (size_t) r.from * row1, (size_t) (r.to - r.from) * row1);
+                continue;
+            }
             io.read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
         }
     }
@@ -2698,12 +2718,22 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             uint64_t v_size_row_ref;
             io.read(&v_size_row_ref, sizeof(v_size_row_ref));
             const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
-            if (v_size_row != v_size_row_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
+            const uint64_t v_size_row_exp = layer.v2 ? (v_size_row | LLAMA_KV_SPLIT_ROW_FLAG) : v_size_row;
+            if (v_size_row_exp != v_size_row_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d, LLAMA_KV_SPLIT_HEADS saved = %d, now = %d)\n",
+                        __func__, v_size_row, (size_t) (v_size_row_ref & ~LLAMA_KV_SPLIT_ROW_FLAG), il,
+                        (int) ((v_size_row_ref & LLAMA_KV_SPLIT_ROW_FLAG) != 0), (int) (layer.v2 != nullptr));
                 return false;
             }
 
             for (const auto & r : runs) {
+                if (layer.v2) {
+                    const size_t row0 = ggml_row_size(v->type, v->ne[0]);
+                    const size_t row1 = ggml_row_size(layer.v2->type, layer.v2->ne[0]);
+                    io.read_tensor(v,        (size_t) r.from * row0, (size_t) (r.to - r.from) * row0);
+                    io.read_tensor(layer.v2, (size_t) r.from * row1, (size_t) (r.to - r.from) * row1);
+                    continue;
+                }
                 io.read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
             }
         }
