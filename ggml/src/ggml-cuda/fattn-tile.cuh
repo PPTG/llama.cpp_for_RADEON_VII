@@ -481,6 +481,12 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 
 // Load a tile of I rows x J columns (starting at column col0) from a q8_0 K/V cache and convert it to f16/f32.
 // Same math as dequantize_q8_0 + to_fp16 (float q*d, rounded to half), so the result matches the f16 conversion path.
+// Two int8 quants (low and high byte) as half2. The values are exact in half precision and the product with the
+// scale in half precision is rounded once, the same as (float) q * d rounded to half.
+static __device__ __forceinline__ half2 flash_attn_tile_q8_pair(const uint16_t v) {
+    return make_half2(__short2half_rn((int8_t) (v & 0xFF)), __short2half_rn((int8_t) (v >> 8)));
+}
+
 template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
 static __device__ __forceinline__ void flash_attn_tile_load_tile_q8_0(
         const char * const __restrict__ KV, const int col0, half2 * const __restrict__ tile_KV, const int64_t stride_bytes,
@@ -504,11 +510,11 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q8_0(
         if (!oob_check || i < i_sup) {
             const int col = col0 + jj;
             const block_q8_0 * b = (const block_q8_0 *) (KV + i*stride_bytes) + col/QK8_0;
-            const float d = __half2float(b->d);
-            const int8_t * q = b->qs + col % QK8_0;
+            const half2 d2 = __half2half2(b->d);
+            const uint16_t * q16 = (const uint16_t *) (b->qs + col % QK8_0);
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
-                vals[l] = make_half2(__float2half((float) q[2*l + 0] * d), __float2half((float) q[2*l + 1] * d));
+                vals[l] = __hmul2(flash_attn_tile_q8_pair(q16[l]), d2);
             }
         } else {
 #pragma unroll
@@ -544,11 +550,13 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q8_0(
         if (!oob_check || i < i_sup) {
             const int col = col0 + jj;
             const block_q8_0 * b = (const block_q8_0 *) (KV + i*stride_bytes) + col/QK8_0;
-            const float d = __half2float(b->d);
-            const int8_t * q = b->qs + col % QK8_0;
+            const half2 d2 = __half2half2(b->d);
+            const uint16_t * q16 = (const uint16_t *) (b->qs + col % QK8_0);
 #pragma unroll
-            for (int l = 0; l < 8; ++l) {
-                vals[l] = __half2float(__float2half((float) q[l] * d));
+            for (int l = 0; l < 4; ++l) {
+                const float2 v = __half22float2(__hmul2(flash_attn_tile_q8_pair(q16[l]), d2));
+                vals[2*l + 0] = v.x;
+                vals[2*l + 1] = v.y;
             }
         } else {
 #pragma unroll
