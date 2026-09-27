@@ -400,20 +400,29 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_q8_config(con
 }
 
 // variant that is actually used: cfg if it is defined for this shape, else 0
+// cfg >= 100: the same variant without the prefetch of the next K/V chunk (GGML_CUDA_FA_Q8_PIPE=0)
 static constexpr __host__ __device__ int ggml_cuda_fattn_tile_q8_cfg_eff(const int DKQ, const int ncols, const int cfg) {
-    return ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg) != 0 ? cfg : 0;
+    return (ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg % 100) != 0 ? cfg % 100 : 0) + (cfg / 100)*100;
 }
 
 static constexpr __device__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols, const int cfg, int) {
-    return cfg != 0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols);
+    return cfg % 100 != 0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg % 100) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols);
 }
 
 static __host__ uint32_t ggml_cuda_fattn_tile_get_config_cfg(const int DKQ, const int DV, const int ncols, const int cfg, const int cc) {
-    return cfg != 0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols, cc);
+    return cfg % 100 != 0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg % 100) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols, cc);
 }
 
 // variant from GGML_CUDA_FA_Q8_CFG, else the fastest on gfx906 (fa-q8-cfg.sh): occupancy 3 for head 512,
 // 128 K columns per step for head 256
+static bool ggml_cuda_fattn_tile_q8_pipe_env() {
+    static const bool pipe = [] {
+        const char * env = getenv("GGML_CUDA_FA_Q8_PIPE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return pipe;
+}
+
 static int ggml_cuda_fattn_tile_q8_cfg_env(const int DKQ) {
     static const int cfg = [] {
         const char * env = getenv("GGML_CUDA_FA_Q8_CFG");
@@ -627,9 +636,98 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q8_0(
     }
 }
 
+// q8_0 K/V chunk of I rows x J values staged in registers: the loads of the next chunk are issued before the current
+// chunk is computed (prefetch), the conversion to f16 and the store to SRAM happen after that. Same values as
+// flash_attn_tile_load_tile_q8_0.
+template<int warp_size, int nwarps, int I, int J>
+struct flash_attn_tile_q8_regs {
+    static constexpr int nunits     = I*(J/8); // 8 values per unit
+    static constexpr int per_thread = (nunits + nwarps*warp_size - 1) / (nwarps*warp_size);
+    uint32_t q[per_thread][2];
+    half     d[per_thread];
+};
+
+template<int warp_size, int nwarps, int I, int J, bool oob_check>
+static __device__ __forceinline__ void flash_attn_tile_q8_prefetch(
+        flash_attn_tile_q8_regs<warp_size, nwarps, I, J> & r, const char * const __restrict__ KV, const int col0,
+        const int64_t stride_bytes, const int i_sup) {
+    using regs_t = flash_attn_tile_q8_regs<warp_size, nwarps, I, J>;
+    constexpr int units_per_row = J/8;
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+#pragma unroll
+    for (int t = 0; t < regs_t::per_thread; ++t) {
+        const int u = t*nwarps*warp_size + tid;
+        const int i = u / units_per_row;
+        if ((regs_t::nunits % (nwarps*warp_size) == 0 || u < regs_t::nunits) && (!oob_check || i < i_sup)) {
+            const int col = col0 + (u % units_per_row)*8;
+            const block_q8_0 * b = (const block_q8_0 *) (KV + i*stride_bytes) + col/QK8_0;
+            const uint16_t * q16 = (const uint16_t *) (b->qs + col % QK8_0);
+            r.q[t][0] = q16[0] | (uint32_t(q16[1]) << 16);
+            r.q[t][1] = q16[2] | (uint32_t(q16[3]) << 16);
+            r.d[t]    = b->d;
+        } else {
+            r.q[t][0] = 0;
+            r.q[t][1] = 0;
+            r.d[t]    = 0.0f;
+        }
+    }
+}
+
+template<int warp_size, int nwarps, int I, int J, int J_padding>
+static __device__ __forceinline__ void flash_attn_tile_q8_store(
+        const flash_attn_tile_q8_regs<warp_size, nwarps, I, J> & r, half2 * const __restrict__ tile_KV) {
+    using regs_t = flash_attn_tile_q8_regs<warp_size, nwarps, I, J>;
+    constexpr int units_per_row = J/8;
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+#pragma unroll
+    for (int t = 0; t < regs_t::per_thread; ++t) {
+        const int u = t*nwarps*warp_size + tid;
+        if (regs_t::nunits % (nwarps*warp_size) != 0 && u >= regs_t::nunits) {
+            break;
+        }
+        const int i  = u / units_per_row;
+        const int jj = (u % units_per_row)*8;
+        const half2 d2 = __half2half2(r.d[t]);
+        __align__(16) half2 vals[4];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            vals[l] = __hmul2(flash_attn_tile_q8_pair(uint16_t(r.q[t][l/2] >> (16*(l % 2)))), d2);
+        }
+        ggml_cuda_memcpy_1<sizeof(vals)>(tile_KV + i*(J/2 + J_padding) + jj/2, vals);
+    }
+}
+
+template<int warp_size, int nwarps, int I, int J, int J_padding>
+static __device__ __forceinline__ void flash_attn_tile_q8_store(
+        const flash_attn_tile_q8_regs<warp_size, nwarps, I, J> & r, float * const __restrict__ tile_KV) {
+    using regs_t = flash_attn_tile_q8_regs<warp_size, nwarps, I, J>;
+    constexpr int units_per_row = J/8;
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+#pragma unroll
+    for (int t = 0; t < regs_t::per_thread; ++t) {
+        const int u = t*nwarps*warp_size + tid;
+        if (regs_t::nunits % (nwarps*warp_size) != 0 && u >= regs_t::nunits) {
+            break;
+        }
+        const int i  = u / units_per_row;
+        const int jj = (u % units_per_row)*8;
+        const half2 d2 = __half2half2(r.d[t]);
+        __align__(16) float vals[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const float2 v = __half22float2(__hmul2(flash_attn_tile_q8_pair(uint16_t(r.q[t][l/2] >> (16*(l % 2)))), d2));
+            vals[2*l + 0] = v.x;
+            vals[2*l + 1] = v.y;
+        }
+        ggml_cuda_memcpy_1<4*sizeof(float)>(tile_KV + i*(J + J_padding) + jj + 0, vals + 0);
+        ggml_cuda_memcpy_1<4*sizeof(float)>(tile_KV + i*(J + J_padding) + jj + 4, vals + 4);
+    }
+}
+
 // Function that performs a single iteration in for the KQ matrix multiplication:
+// do_load == false: the K chunk is already in KV_tmp (q8_0 prefetch pipeline)
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, ggml_type type_KV, typename T_vec_dot>
+    bool use_logit_softcap, bool oob_check, ggml_type type_KV, typename T_vec_dot, bool do_load = true>
 static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         T_vec_dot   * const Q_tmp,
         const half2 * const __restrict__ K_h2,
@@ -646,15 +744,18 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
 
-    if constexpr (type_KV == GGML_TYPE_Q8_0) {
+    if constexpr (!do_load) {
+        // the caller stored the chunk and synced
+    } else if constexpr (type_KV == GGML_TYPE_Q8_0) {
         static_assert(nbatch_K % 8 == 0, "bad nbatch_K");
         flash_attn_tile_load_tile_q8_0<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
             ((const char *) (K_h2 + int64_t(k_VKQ_0)*stride_K2), k_KQ_0, KV_tmp, int64_t(stride_K2)*sizeof(half2), k_VKQ_sup);
+        __syncthreads();
     } else {
         flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
             (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+        __syncthreads();
     }
-    __syncthreads();
 
 #ifdef FAST_FP16_AVAILABLE
     static_assert((nbatch_K/2) % cpy_ne == 0, "bad nbatch_K");
@@ -709,8 +810,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 }
 
 // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
+// pipe: q8_0 K/V chunks go through registers, the loads of the next chunk overlap the computation of the current one
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, ggml_type type_KV, typename T_vec_dot, typename T_KQ, typename T_acc>
+    bool use_logit_softcap, bool oob_check, ggml_type type_KV, bool pipe, typename T_vec_dot, typename T_KQ, typename T_acc>
 static __device__ __forceinline__ void flash_attn_tile_iter(
         T_vec_dot * const Q_tmp,
         const half2 * const __restrict__ K_h2,
@@ -757,14 +859,43 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
     float KQ_acc[nbatch_fa/(np*warp_size) * cpw] = {0.0f}; // Accumulators for KQ matrix multiplication.
 
+    // V chunk size, see the VKQ multiplication below
+    constexpr int nbatch_V_pipe = (DV % nbatch_K == 0 ? nbatch_K : nbatch_K*2/3) * nbatch_fa / DV;
+    using regs_K_t = flash_attn_tile_q8_regs<warp_size, nwarps, nbatch_fa, nbatch_K>;
+    using regs_V_t = flash_attn_tile_q8_regs<warp_size, nwarps, nbatch_V_pipe, DV>;
+    // only if the staged chunks need few registers (not for the head 256 variant with 128 K columns, it spills already)
+    constexpr bool q8_pipe = pipe && type_KV == GGML_TYPE_Q8_0 && DKQ % nbatch_K == 0 && DV % nbatch_K == 0 &&
+        regs_K_t::per_thread <= 4 && regs_V_t::per_thread <= 4;
+    [[maybe_unused]] regs_V_t regs_V;
+
     // KQ = K @ Q matrix multiplication:
     constexpr int nbatch_K_last = DKQ % nbatch_K;
+    if constexpr (q8_pipe) {
+        regs_K_t regs_K;
+        flash_attn_tile_q8_prefetch<warp_size, nwarps, nbatch_fa, nbatch_K, oob_check>
+            (regs_K, (const char *) (K_h2 + int64_t(k_VKQ_0)*stride_K2), 0, int64_t(stride_K2)*sizeof(half2), k_VKQ_sup);
+#pragma unroll
+        for (int k_KQ_0 = 0; k_KQ_0 < DKQ; k_KQ_0 += nbatch_K) {
+            flash_attn_tile_q8_store<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne>(regs_K, KV_tmp);
+            __syncthreads();
+            if (k_KQ_0 + nbatch_K < DKQ) {
+                flash_attn_tile_q8_prefetch<warp_size, nwarps, nbatch_fa, nbatch_K, oob_check>
+                    (regs_K, (const char *) (K_h2 + int64_t(k_VKQ_0)*stride_K2), k_KQ_0 + nbatch_K, int64_t(stride_K2)*sizeof(half2), k_VKQ_sup);
+            } else {
+                flash_attn_tile_q8_prefetch<warp_size, nwarps, nbatch_V_pipe, DV, oob_check>
+                    (regs_V, (const char *) (V_h2 + int64_t(k_VKQ_0)*stride_V2), 0, int64_t(stride_V2)*sizeof(half2), k_VKQ_sup);
+            }
+            flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV,
+                T_vec_dot, false>(Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+        }
+    } else {
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>(
             Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
     }
-    if (nbatch_K_last > 0) {
+    }
+    if (!q8_pipe && nbatch_K_last > 0) {
         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, type_KV>(
             Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
@@ -870,16 +1001,26 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     constexpr int nbatch_V = (DV % nbatch_K == 0 ? nbatch_K : nbatch_K*2/3) * nbatch_fa / DV; // Number of V columns that fit in SRAM for K.
     static_assert(nbatch_fa % nbatch_V == 0, "bad nbatch_V");
     static_assert(nbatch_V % np == 0, "bad nbatch_V");
+    static_assert(nbatch_V == nbatch_V_pipe, "bad nbatch_V");
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
-        if constexpr (type_KV == GGML_TYPE_Q8_0) {
+        if constexpr (q8_pipe) {
+            flash_attn_tile_q8_store<warp_size, nwarps, nbatch_V, DV, 0>(regs_V, KV_tmp);
+            __syncthreads();
+            if (k0 + nbatch_V < nbatch_fa) {
+                flash_attn_tile_q8_prefetch<warp_size, nwarps, nbatch_V, DV, oob_check>
+                    (regs_V, (const char *) (V_h2 + int64_t(k_VKQ_0 + k0 + nbatch_V)*stride_V2), 0, int64_t(stride_V2)*sizeof(half2),
+                     k_VKQ_sup - k0 - nbatch_V);
+            }
+        } else if constexpr (type_KV == GGML_TYPE_Q8_0) {
             flash_attn_tile_load_tile_q8_0<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
                 ((const char *) (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2), 0, KV_tmp, int64_t(stride_V2)*sizeof(half2), k_VKQ_sup - k0);
+            __syncthreads();
         } else {
             flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
                 (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+            __syncthreads();
         }
-        __syncthreads();
 
 #ifdef FAST_FP16_AVAILABLE
 #pragma unroll
@@ -1122,14 +1263,14 @@ static __global__ void flash_attn_tile(
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, (cfg < 100)>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, (cfg < 100)>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
@@ -1137,7 +1278,7 @@ static __global__ void flash_attn_tile(
         // Branch without out-of-bounds checks.
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
             constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, (cfg < 100)>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
@@ -1352,14 +1493,23 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             auto launch_q8 = [&](auto cols_per_block_c) {
                 constexpr int cols_per_block = decltype(cols_per_block_c)::value;
                 constexpr bool tunable = cols_per_block == ncols2 && ggml_cuda_fattn_tile_q8_config(DKQ, cols_per_block, 2) != 0;
+                const bool pipe = ggml_cuda_fattn_tile_q8_pipe_env();
                 if constexpr (tunable) {
                     switch (ggml_cuda_fattn_tile_q8_cfg_env(DKQ)) {
-                        case 2: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 2)>{}); return;
-                        case 3: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 3)>{}); return;
-                        default: break;
+                        case 2:
+                            pipe ? launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block,   2)>{})
+                                 : launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 102)>{});
+                            return;
+                        case 3:
+                            pipe ? launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block,   3)>{})
+                                 : launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 103)>{});
+                            return;
+                        default:
+                            break;
                     }
                 }
-                launch_q8_cfg(cols_per_block_c, std::integral_constant<int, 0>{});
+                pipe ? launch_q8_cfg(cols_per_block_c, std::integral_constant<int,   0>{})
+                     : launch_q8_cfg(cols_per_block_c, std::integral_constant<int, 100>{});
             };
             if constexpr (ncols2 <= 2) {
                 if (Q->ne[1] <= 2/ncols2) {
