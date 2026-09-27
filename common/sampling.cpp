@@ -133,11 +133,12 @@ struct common_sampler {
     int32_t fast_margin = 0;
     std::vector<llama_token> fast_extra;
 
-    // candidates: the n largest logits (a min-heap, most logits are rejected by one compare) plus fast_extra
-    bool set_logits_top(struct llama_context * ctx, int idx) {
+    // candidates: the n = fast_top_k + fast_margin + n_more largest logits (a min-heap, most logits are rejected by one
+    // compare) in cur[0, n), then fast_extra
+    bool set_logits_top(struct llama_context * ctx, int idx, int n_more = 0) {
         const llama_model * model = llama_get_model(ctx);
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
-        const int n = fast_top_k + fast_margin;
+        const int n = fast_top_k + fast_margin + n_more;
         if (n >= n_vocab || llama_get_sampled_logits_ith(ctx, idx) || llama_get_sampled_probs_ith(ctx, idx)) {
             return false;
         }
@@ -800,15 +801,43 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    bool resampled = false;
+    if (gsmpl->fast_top_k > 0 && (!rbudget || common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING)) {
+        // the grammar only lowers logits too: if at least top_k + margin of the n largest logits are valid, no other
+        // token can get into the top-k and the chain gives the same result as on all logits (else: all logits; a
+        // second try with more logits cost more than it saved when few tokens are valid)
+        for (const int n_more : { 1024 }) {
+            if (!gsmpl->set_logits_top(ctx, idx, n_more)) {
+                break;
+            }
+            const int n_top = gsmpl->fast_top_k + gsmpl->fast_margin + n_more;
 
-    llama_sampler_apply(rbudget,  &cur_p);
+            llama_sampler_apply(rbudget, &cur_p);
+            llama_sampler_apply(grmr,    &cur_p);
 
-    if (grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr,  &cur_p);
+            int n_valid = 0;
+            for (int i = 0; i < n_top; ++i) {
+                n_valid += cur_p.data[i].logit != -INFINITY;
+            }
+            if (n_valid >= gsmpl->fast_top_k + gsmpl->fast_margin) {
+                llama_sampler_apply(chain, &cur_p);
+                resampled = true;
+                break;
+            }
+        }
     }
 
-    llama_sampler_apply(chain, &cur_p);
+    if (!resampled) {
+        gsmpl->set_logits(ctx, idx);
+
+        llama_sampler_apply(rbudget,  &cur_p);
+
+        if (grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(grmr,  &cur_p);
+        }
+
+        llama_sampler_apply(chain, &cur_p);
+    }
 
     GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
 
