@@ -10116,10 +10116,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (int64_t n : { 64, 1536, 2816 }) {
-        for (bool weight_first : { false, true }) {
-            test_cases.emplace_back(new test_rms_norm_scale_mul({ n, 1, 1, 1 }, 1e-6f, weight_first));
-            test_cases.emplace_back(new test_rms_norm_scale_mul({ n, 5, 4, 3 }, 1e-6f, weight_first));
-        }
+        // ggml_mul only broadcasts src1, so the weight can only be src0 when the shapes are equal
+        test_cases.emplace_back(new test_rms_norm_scale_mul({ n, 1, 1, 1 }, 1e-6f, false));
+        test_cases.emplace_back(new test_rms_norm_scale_mul({ n, 1, 1, 1 }, 1e-6f, true));
+        test_cases.emplace_back(new test_rms_norm_scale_mul({ n, 5, 4, 3 }, 1e-6f, false));
     }
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, true));
