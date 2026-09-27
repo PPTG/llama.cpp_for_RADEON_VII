@@ -14,11 +14,16 @@ DEPTHS=${DEPTHS:-"0,32768,65536,120000"}
 ROCM_PATH=${ROCM_PATH:-/opt/rocm}
 export PATH="${ROCM_PATH}/bin:${PATH}"
 
-for KV in f16 q8_0; do
-    echo "=== KV cache ${KV}"
-    "${BIN}/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -sm layer -ctk "${KV}" -ctv "${KV}" -p 0 -n 32 -r 1 -d "${DEPTHS}" -o md 2>&1 \
+run() {
+    local name=$1 kv=$2; shift 2
+    echo "=== ${name}"
+    env "$@" "${BIN}/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -sm layer -ctk "${kv}" -ctv "${kv}" -p 0 -n 32 -r 1 -d "${DEPTHS}" -o md 2>&1 \
         | grep -E "tg32|error|failed"
-done
+}
+
+run "KV f16"                                   f16
+run "KV q8_0, FA tile reads q8_0 (new)"        q8_0
+run "KV q8_0, FA tile converts to f16 (old)"   q8_0 GGML_CUDA_FA_TILE_Q8=0
 
 [ -n "${SKIP_PROFILE:-}" ] && exit 0
 
