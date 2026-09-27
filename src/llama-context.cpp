@@ -532,7 +532,16 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
-            if (device_fused != device_layer) {
+            // LLAMA_KV_SPLIT_HEADS: the attention of the second half of the KV heads runs on the GPU of its KV cache
+            static const bool split_heads = [] {
+                const char * env = getenv("LLAMA_KV_SPLIT_HEADS");
+                return env != nullptr && atoi(env) != 0;
+            }();
+            const bool split_part_ok = split_heads && device_fused && device_layer &&
+                ggml_backend_dev_type(device_fused) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                ggml_backend_dev_type(device_layer) == GGML_BACKEND_DEVICE_TYPE_GPU;
+
+            if (device_fused != device_layer && !split_part_ok) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
                         func, node.il,
