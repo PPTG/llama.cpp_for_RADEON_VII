@@ -486,6 +486,9 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q8_0(
         const char * const __restrict__ KV, const int col0, half2 * const __restrict__ tile_KV, const int64_t stride_bytes,
         const int i_sup) {
     static_assert(J % 8 == 0, "bad J");
+    if constexpr (J == 0) {
+        return; // instantiated for an empty last K chunk that is never used
+    } else {
     constexpr int units_per_row = J/8; // 8 values per unit
     const int tid = threadIdx.y*warp_size + threadIdx.x;
 #pragma unroll
@@ -515,6 +518,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q8_0(
         }
         ggml_cuda_memcpy_1<sizeof(vals)>(tile_KV + i*(J/2 + J_padding) + jj/2, vals);
     }
+    }
 }
 
 template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
@@ -522,6 +526,9 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q8_0(
         const char * const __restrict__ KV, const int col0, float * const __restrict__ tile_KV, const int64_t stride_bytes,
         const int i_sup) {
     static_assert(J % 8 == 0, "bad J");
+    if constexpr (J == 0) {
+        return; // instantiated for an empty last K chunk that is never used
+    } else {
     constexpr int units_per_row = J/8;
     const int tid = threadIdx.y*warp_size + threadIdx.x;
 #pragma unroll
@@ -551,6 +558,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q8_0(
         }
         ggml_cuda_memcpy_1<4*sizeof(float)>(tile_KV + i*(J + J_padding) + jj + 0, vals + 0);
         ggml_cuda_memcpy_1<4*sizeof(float)>(tile_KV + i*(J + J_padding) + jj + 4, vals + 4);
+    }
     }
 }
 
