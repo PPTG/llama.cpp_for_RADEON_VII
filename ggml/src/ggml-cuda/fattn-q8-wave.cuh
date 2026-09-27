@@ -148,8 +148,9 @@ static __global__ void flash_attn_q8_wave(
     // VKQ lane layout: 8 values of the q8_0 block pair pv, taken from 3 dwords of the pair (see the V loop)
     const int pv  = lane / 8;
     const int sub = lane % 8;
-    const int offAB = 68*pv + 4*(2*sub + 1);          // 2 dwords with the quants
-    const int offC  = 68*pv + (sub < 4 ? 0 : 32);     // dword with the scale (and for sub 3 the quants 0, 1)
+    // unsigned offsets: SGPR base + 32 bit VGPR offset addressing
+    const uint32_t offAB = 68*pv + 4*(2*sub + 1);      // 2 dwords with the quants
+    const uint32_t offC  = 68*pv + (sub < 4 ? 0 : 32); // dword with the scale (and for sub 3 the quants 0, 1)
     const uint32_t mB = sub == 3 ? 0x0000FFFFu : 0xFFFFFFFFu;
     const int shC = sub < 4 ? 0 : 16;
 
@@ -168,8 +169,14 @@ static __global__ void flash_attn_q8_wave(
 
     int * Ks = K_s[wave];
 
-    for (int k0 = (blockIdx.y*NW + wave)*NR; k0 < ne11; k0 += gridDim.y*NW*NR) {
-        const int nrows = min(NR, ne11 - k0); // rows >= nrows use the data of the last row and get p = 0
+    // each wave computes a contiguous range of rows (same number for all waves), in steps of up to 64 rows
+    const int nwaves_all = gridDim.y*NW;
+    const int rows_wave  = (ne11 + nwaves_all - 1) / nwaves_all;
+    const int k_begin    = (blockIdx.y*NW + wave)*rows_wave;
+    const int k_end      = min(ne11, k_begin + rows_wave);
+
+    for (int k0 = k_begin; k0 < k_end; k0 += NR) {
+        const int nrows = min(NR, k_end - k0); // rows >= nrows use the data of the last row and get p = 0
 
         // KQ: lane = K row. Staging loads: 4 dwordx4 (16 rows, 4 lanes per row) + 1 dword (lane = row) per pair
         const char * K_c = K_h + int64_t(k0)*nb11;
@@ -257,10 +264,10 @@ static __global__ void flash_attn_q8_wave(
             }
         }
 
-        // softcap, mask, online softmax. p of the row of this lane packed as half2 (p, p) for the V loop
+        // softcap, mask, online softmax. p of the rows as half2 (p, p) in LDS [row][column], read as a broadcast
         const bool  row_ok = lane < nrows;
         const float mk     = row_ok && maskh ? __half2float(maskh[k0 + lane]) : 0.0f;
-        uint32_t pd[NC];
+        fa_q8w_wave_sync(); // all lanes have read the K rows
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
             float x = KQ[c];
@@ -281,9 +288,9 @@ static __global__ void flash_attn_q8_wave(
             for (int k = 0; k < 4; ++k) {
                 VKQ[c][k] *= ms2;
             }
-            const half2 p2 = make_half2(pc, pc);
-            pd[c] = *((const uint32_t *) &p2);
+            ((half2 *) Ks)[lane*NC + c] = make_half2(pc, pc);
         }
+        fa_q8w_wave_sync();
 
         // VKQ: lane = 8 values of the V row. Rows in groups of 4, the next group is loaded while computing the current
         const char * V_c = V_h + int64_t(k0)*nb21;
@@ -325,10 +332,12 @@ static __global__ void flash_attn_q8_wave(
                 for (int k = 0; k < 4; ++k) {
                     v[k] = __hmul2(v[k], d2); // half(q*d) as in the conversion to f16
                 }
+                const uint4 p0 = ((const uint4 *) Ks)[2*(r0 + i) + 0];
+                const uint4 p1 = ((const uint4 *) Ks)[2*(r0 + i) + 1];
+                const uint32_t pr[NC] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
 #pragma unroll
                 for (int c = 0; c < NC; ++c) {
-                    const uint32_t pr = __builtin_amdgcn_readlane(pd[c], r0 + i);
-                    const half2 p2 = *((const half2 *) &pr);
+                    const half2 p2 = *((const half2 *) &pr[c]);
 #pragma unroll
                     for (int k = 0; k < 4; ++k) {
                         VKQ[c][k] = __hfma2(v[k], p2, VKQ[c][k]);
