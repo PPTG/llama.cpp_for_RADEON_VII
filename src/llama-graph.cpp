@@ -2795,9 +2795,20 @@ ggml_tensor * llm_graph_context::build_attn_split_heads(
         }
     };
 
-    // the second part (other device) goes first in the graph: its inputs are copied to the other device as soon as Q, K
-    // and V are ready, and its attention runs while the first part is computed on the device of the layer
-    // store
+    const int64_t n_head_kv = k0->ne[1] + k1->ne[1];
+    GGML_ASSERT(q->ne[1] % n_head_kv == 0);
+    const int64_t n_q0 = k0->ne[1] * (q->ne[1] / n_head_kv);
+
+    ggml_tensor * qs[2] = {
+        ggml_view_3d(ctx0, q, q->ne[0], n_q0,            q->ne[2], q->nb[1], q->nb[2], 0),
+        ggml_view_3d(ctx0, q, q->ne[0], q->ne[1] - n_q0, q->ne[2], q->nb[1], q->nb[2], n_q0*q->nb[1]),
+    };
+    ggml_tensor * ks[2] = { k0, k1 };
+    ggml_tensor * vs[2] = { v0, v1 };
+    ggml_tensor * curs[2] = { nullptr, nullptr };
+
+    // store + attention of the second part (other device) first, then of the first part: one graph split per device,
+    // the inputs of the second part are copied as soon as Q, K and V are ready and both devices compute at the same time
     for (int part = 1; part >= 0; --part) {
         if (k_cur) {
             ggml_tensor * t = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il, part);
@@ -2809,29 +2820,20 @@ ggml_tensor * llm_graph_context::build_attn_split_heads(
             pin(t, part);
             ggml_build_forward_expand(gf, t);
         }
-    }
 
-    const int64_t n_head_kv = k0->ne[1] + k1->ne[1];
-    GGML_ASSERT(q->ne[1] % n_head_kv == 0);
-    const int64_t n_q0 = k0->ne[1] * (q->ne[1] / n_head_kv);
+        curs[part] = build_attn_mha(qs[part], ks[part], vs[part], nullptr, kq_mask, nullptr, nullptr, 0, kq_scale, il);
 
-    ggml_tensor * q0 = ggml_view_3d(ctx0, q, q->ne[0], n_q0,            q->ne[2], q->nb[1], q->nb[2], 0);
-    ggml_tensor * q1 = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1] - n_q0, q->ne[2], q->nb[1], q->nb[2], n_q0*q->nb[1]);
-
-    ggml_tensor * cur1 = build_attn_mha(q1, k1, v1, nullptr, kq_mask, nullptr, nullptr, 0, kq_scale, il);
-    ggml_tensor * cur0 = build_attn_mha(q0, k0, v0, nullptr, kq_mask, nullptr, nullptr, 0, kq_scale, il);
-
-    ggml_tensor * curs[2] = { cur0, cur1 };
-    for (int part = 0; part < 2; ++part) {
         ggml_tensor * fa = curs[part];
         while (fa && fa->op != GGML_OP_FLASH_ATTN_EXT) {
             fa = fa->view_src ? fa->view_src : fa->src[0];
         }
         GGML_ASSERT(fa != nullptr);
         pin(fa, part);
+        ggml_build_forward_expand(gf, curs[part]);
     }
-    ggml_build_forward_expand(gf, cur1);
-    ggml_build_forward_expand(gf, cur0);
+
+    ggml_tensor * cur0 = curs[0];
+    ggml_tensor * cur1 = curs[1];
 
     // [n_embd_head_v*n_head_q, n_tokens], on the device of the layer
     ggml_tensor * cur = ggml_concat(ctx0, cur0, cur1, 0);
