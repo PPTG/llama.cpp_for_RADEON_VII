@@ -714,20 +714,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            // Tuning knob: GGML_CUDA_FA_Q8_VEC=0/1: for a q8_0 cache with head size 256 and batch size 1 use the tile
-            // kernel (reads q8_0 directly unless GGML_CUDA_FA_TILE_Q8=0) or the vector kernel. Default tile on HIP.
+            // Tuning knob: GGML_CUDA_FA_Q8_VEC=0 uses the tile kernel (reads q8_0 directly unless GGML_CUDA_FA_TILE_Q8=0)
+            // instead of the vector kernel for a q8_0 cache with head size 256 and batch size 1.
+            // Experimental: gave wrong text with Gemma 4 on gfx906.
             static const bool q8_vec = [] {
                 const char * env = getenv("GGML_CUDA_FA_Q8_VEC");
-                if (env != nullptr) {
-                    return atoi(env) != 0;
-                }
-#ifdef GGML_USE_HIP
-                return false;
-#else
-                return true;
-#endif // GGML_USE_HIP
+                return env == nullptr || atoi(env) != 0;
             }();
-            const bool q8_tile = !q8_vec && K->type == GGML_TYPE_Q8_0 &&
+            const bool q8_tile = !q8_vec && gqa_opt_applies && K->type == GGML_TYPE_Q8_0 &&
                 V->type == GGML_TYPE_Q8_0 && Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1]*gqa_ratio_eff <= 8;
             if (Q->ne[1] <= 2 && !q8_tile) {
                 return BEST_FATTN_KERNEL_VEC;

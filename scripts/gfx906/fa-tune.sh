@@ -17,4 +17,4 @@ run() {
 }
 
 run "default"
-run "q8_0 head 256 on the vector kernel (GGML_CUDA_FA_Q8_VEC=1)" GGML_CUDA_FA_Q8_VEC=1
+run "q8_0 head 256 on the tile kernel (GGML_CUDA_FA_Q8_VEC=0)" GGML_CUDA_FA_Q8_VEC=0

@@ -11344,6 +11344,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Gemma 4 26B A4B token generation SWA layers: head size 256, 8 KV heads, GQA 2, as in the model (Q permuted)
+    for (int kv : { 512, 1536 }) {
+        for (int nb : { 1, 2 }) {
+            for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                for (bool permute : { false, true }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                        type_KV, type_KV, permute ? std::array<int32_t, 4>{0, 2, 1, 3} : std::array<int32_t, 4>{0, 1, 2, 3}));
+                }
+            }
+        }
+    }
+
     // Gemma 4 style token generation: head size 512 (global) / 256 (SWA), 2 KV heads, GQA 8, q8_0 or f16 KV cache
     for (int hs : { 256, 512 }) {
         for (int kv : { 512, 4096, 16384 }) {
