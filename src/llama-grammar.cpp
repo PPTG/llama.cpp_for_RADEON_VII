@@ -1209,6 +1209,7 @@ struct llama_grammar * llama_grammar_init_impl(
         /* .trigger_buffer_positions = */ {},
         /* .trigger_tokens = */           {},
         /* .trigger_patterns = */         {},
+        /* .first_cps = */                nullptr,
     };
 }
 
@@ -1315,6 +1316,7 @@ struct llama_grammar * llama_grammar_init_impl(
         /* .trigger_buffer_positions = */ {},
         std::move(vec_trigger_tokens),
         std::move(vec_trigger_patterns),
+        /* .first_cps = */ nullptr,
     };
 }
 
@@ -1338,6 +1340,7 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
         grammar.trigger_buffer_positions,
         grammar.trigger_tokens,
         grammar.trigger_patterns,
+        grammar.first_cps,
     };
 
     // redirect elements in stacks to point to new rules
@@ -1354,6 +1357,50 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
     }
 
     return result;
+}
+
+// first code point of every token for the grammar pre-filter, or one of the codes below (built once per vocab)
+static constexpr uint32_t LLAMA_GRAMMAR_CP_EOG   = 0xFFFFFFFF; // end of generation token
+static constexpr uint32_t LLAMA_GRAMMAR_CP_EMPTY = 0xFFFFFFFE; // empty piece or 0 byte first: always rejected
+static constexpr uint32_t LLAMA_GRAMMAR_CP_FULL  = 0xFFFFFFFD; // invalid or incomplete UTF-8: full check
+
+static const std::vector<uint32_t> & llama_grammar_first_cps(const llama_grammar & grammar) {
+    if (grammar.first_cps) {
+        return *grammar.first_cps;
+    }
+    const llama_vocab * vocab = grammar.vocab;
+    std::vector<uint32_t> cps(vocab->n_tokens());
+    for (uint32_t id = 0; id < cps.size(); ++id) {
+        const std::string & piece = vocab->token_to_piece(id);
+        uint32_t cp = LLAMA_GRAMMAR_CP_FULL;
+        if (vocab->is_eog(id)) {
+            cp = LLAMA_GRAMMAR_CP_EOG;
+        } else if (piece.empty() || piece[0] == 0) {
+            cp = LLAMA_GRAMMAR_CP_EMPTY;
+        } else {
+            // first code point as decode_utf8 computes it
+            const uint8_t b0 = static_cast<uint8_t>(piece[0]);
+            if (b0 < 0x80) {
+                cp = b0;
+            } else if (b0 >= 0xC0) {
+                const int len = b0 < 0xE0 ? 2 : (b0 < 0xF0 ? 3 : 4);
+                if ((int) piece.size() >= len) {
+                    uint32_t chr = b0 & ((1 << (8 - len)) - 1);
+                    bool ok = true;
+                    for (int k = 1; k < len; ++k) {
+                        ok = ok && piece[k] != 0;
+                        chr = (chr << 6) + (static_cast<uint8_t>(piece[k]) & 0x3F);
+                    }
+                    if (ok && chr < LLAMA_GRAMMAR_CP_FULL) {
+                        cp = chr;
+                    }
+                }
+            }
+        }
+        cps[id] = cp;
+    }
+    grammar.first_cps = std::make_shared<const std::vector<uint32_t>>(std::move(cps));
+    return *grammar.first_cps;
 }
 
 void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_data_array * cur_p) {
@@ -1395,15 +1442,46 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
     };
     int8_t ascii_ok[128];
     std::fill(ascii_ok, ascii_ok + 128, (int8_t) -1);
+    const std::vector<uint32_t> * first_cps = prefilter ? &llama_grammar_first_cps(grammar) : nullptr;
 
     std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
-    candidates_decoded.reserve(cur_p->size);
+    candidates_decoded.reserve(prefilter ? 256 : cur_p->size);
 
     llama_grammar_candidates candidates_grammar;
-    candidates_grammar.reserve(cur_p->size);
+    candidates_grammar.reserve(prefilter ? 256 : cur_p->size);
 
     for (size_t i = 0; i < cur_p->size; ++i) {
-        const llama_token id      = cur_p->data[i].id;
+        const llama_token id = cur_p->data[i].id;
+
+        if (prefilter) {
+            const uint32_t cp = (*first_cps)[id];
+            if (cp == LLAMA_GRAMMAR_CP_EOG) {
+                if (!allow_eog) {
+                    cur_p->data[i].logit = -INFINITY;
+                }
+                continue;
+            }
+            if (cp == LLAMA_GRAMMAR_CP_EMPTY) {
+                cur_p->data[i].logit = -INFINITY;
+                continue;
+            }
+            if (cp != LLAMA_GRAMMAR_CP_FULL) {
+                bool ok;
+                if (cp < 128) {
+                    if (ascii_ok[cp] < 0) {
+                        ascii_ok[cp] = first_cp_matches(cp) ? 1 : 0;
+                    }
+                    ok = ascii_ok[cp] != 0;
+                } else {
+                    ok = first_cp_matches(cp);
+                }
+                if (!ok) {
+                    cur_p->data[i].logit = -INFINITY;
+                    continue;
+                }
+            }
+        }
+
         const std::string & piece = grammar.vocab->token_to_piece(id);
 
         if (grammar.vocab->is_eog(id)) {
@@ -1411,32 +1489,6 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
                 cur_p->data[i].logit = -INFINITY;
             }
         } else if (piece.empty() || piece[0] == 0) {
-            cur_p->data[i].logit = -INFINITY;
-        } else if (prefilter && [&] {
-                // first code point as decode_utf8 computes it; invalid or incomplete sequences go the full way
-                const uint8_t b0 = static_cast<uint8_t>(piece[0]);
-                if (b0 < 0x80) {
-                    if (ascii_ok[b0] < 0) {
-                        ascii_ok[b0] = first_cp_matches(b0) ? 1 : 0;
-                    }
-                    return ascii_ok[b0] == 0;
-                }
-                if (b0 < 0xC0) {
-                    return false;
-                }
-                const int len = b0 < 0xE0 ? 2 : (b0 < 0xF0 ? 3 : 4);
-                if ((int) piece.size() < len) {
-                    return false;
-                }
-                uint32_t chr = b0 & ((1 << (8 - len)) - 1);
-                for (int k = 1; k < len; ++k) {
-                    if (piece[k] == 0) {
-                        return false;
-                    }
-                    chr = (chr << 6) + (static_cast<uint8_t>(piece[k]) & 0x3F);
-                }
-                return !first_cp_matches(chr);
-            }()) {
             cur_p->data[i].logit = -INFINITY;
         } else {
             candidates_decoded.push_back(decode_utf8(piece, grammar.partial_utf8));

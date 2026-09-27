@@ -849,6 +849,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
         if (grammar_should_apply(gsmpl)) {
             llama_sampler_apply(grmr,  &cur_p);
+
+            // drop the rejected tokens (probability 0, they stay behind every other token), the chain runs on the rest
+            if (gsmpl->fast_top_k > 0) {
+                size_t n = 0;
+                for (size_t i = 0; i < cur_p.size; ++i) {
+                    if (cur_p.data[i].logit != -INFINITY) {
+                        cur_p.data[n++] = cur_p.data[i];
+                    }
+                }
+                if (n > 0) {
+                    cur_p.size = n;
+                }
+            }
         }
 
         llama_sampler_apply(chain, &cur_p);

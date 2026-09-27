@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <map>
+#include <memory>
 #include <regex>
 #include <string>
 #include <vector>
@@ -148,6 +149,8 @@ struct llama_grammar {
                              trigger_patterns;         // Regular expressions that trigger a lazy grammar. Must be a full match of the entire generated
                                                        // string, and the grammar will be given the string from the first match group onwards.
 
+    // first code point of every token for the pre-filter in llama_grammar_apply_impl, built on first use, shared by clones
+    mutable std::shared_ptr<const std::vector<uint32_t>> first_cps;
 };
 
 //
