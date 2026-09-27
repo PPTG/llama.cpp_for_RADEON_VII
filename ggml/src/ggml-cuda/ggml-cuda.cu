@@ -4453,7 +4453,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * mm = cgraph->nodes[i + 1];
         if ((mm->op == GGML_OP_MUL_MAT || mm->op == GGML_OP_MUL_MAT_ID) && mm->src[1] == node &&
                 ggml_is_quantized(mm->src[0]->type) && ggml_cuda_glu_quantize_q8_1_supported(node) &&
-                ggml_cuda_should_fuse_mul_mat_vec_q(mm) && ggml_can_fuse(cgraph, i, { GGML_OP_GLU, mm->op })) {
+                ggml_cuda_should_fuse_mul_mat_vec_q(mm) &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, mm->op }, { i + 1 })) { // (ggml_can_fuse needs equal shapes)
             const int64_t ne0_padded = GGML_PAD(node->ne[0], MATRIX_ROW_PADDING);
             ggml_cuda_pool_alloc<char> q8(cuda_ctx->pool(), ggml_nrows(node) * ne0_padded * sizeof(block_q8_1) / QK8_1);
             ggml_cuda_glu_quantize_q8_1(*cuda_ctx, node, q8.get(), ne0_padded);
