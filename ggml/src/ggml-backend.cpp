@@ -1660,7 +1660,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        // (not between two GPU backends: every backend has its own buffers and the copies between them are ordered on
+        // the GPU streams; a host wait here would serialize independent work of two GPUs, GGML_SCHED_GPU_SPLIT_SYNC=1
+        // restores it)
+        static const bool gpu_split_sync = getenv("GGML_SCHED_GPU_SPLIT_SYNC") != nullptr && atoi(getenv("GGML_SCHED_GPU_SPLIT_SYNC")) != 0;
+        const bool both_gpu = prev_backend_id >= 0 &&
+            ggml_backend_dev_type(ggml_backend_get_device(sched->backends[prev_backend_id])) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU;
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && (!both_gpu || gpu_split_sync)) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
