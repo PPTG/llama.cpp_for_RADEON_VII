@@ -13,7 +13,7 @@ run() {
     echo "=== ${1}"
     shift
     env "$@" "${BIN}/test-backend-ops" perf -b ROCm0 -o FLASH_ATTN_EXT -p "hsk=(256|512),hsv=.*nb=1," 2>&1 \
-        | grep -E "FLASH_ATTN_EXT\(" | sed -E 's/FLASH_ATTN_EXT\(hsk=([0-9]+),hsv=[0-9]+,nh=([0-9]+),nr23=\[([0-9]+),1\],kv=([0-9]+),.*type_K=([a-z0-9_]+).*\): +[0-9]+ runs - +([0-9.]+ us\/run).*/hs=\1 nh=\2 gqa=\3 kv=\4 \5: \6/'
+        | grep -E "FLASH_ATTN_EXT\(" | sed -E 's/FLASH_ATTN_EXT\(hsk=([0-9]+),hsv=[0-9]+,nh=([0-9]+),nr23=\[([0-9]+),1\],kv=([0-9]+),.*type_K=([a-z0-9_]+),.*permute=\[([0-9,]+)\].*\): +[0-9]+ runs - +([0-9.]+ us\/run).*/hs=\1 nh=\2 gqa=\3 kv=\4 \5 perm=\6: \7/'
 }
 
 run "default"

@@ -11751,10 +11751,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // token generation attention of Gemma 4 26B A4B: SWA layers (head 256, 8 KV heads, GQA 2, window 1024 + ubatch)
     // and global layers (head 512, 2 KV heads, GQA 8) at long context
+    // permute {0, 2, 1, 3}: the KV cache layout of the model (rows of all KV heads interleaved)
     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 1536, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
-        for (int kv : { 4096, 16384, 65536, 131072 }) {
-            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        for (bool model_layout : { false, true }) {
+            const std::array<int32_t, 4> perm = model_layout ? std::array<int32_t, 4>{0, 2, 1, 3} : std::array<int32_t, 4>{0, 1, 2, 3};
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 1536, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, perm));
+            for (int kv : { 4096, 16384, 65536, 131072 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, perm));
+            }
         }
     }
 
