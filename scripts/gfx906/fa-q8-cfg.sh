@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tuning variants of the FA tile kernel that reads a q8_0 KV cache (GGML_CUDA_FA_Q8_CFG=0/2/3, default 3 for head 512, 2 for head 256)
+# Tuning variants of the FA tile kernel that reads a q8_0 KV cache (GGML_CUDA_FA_Q8_CFG=0/2/3, default 3 for head 512, 0 for head 256)
 # with and without the prefetch of the next K/V chunk (GGML_CUDA_FA_Q8_PIPE): correctness vs CPU and
 # time for the Gemma 4 token generation shapes (SWA head 256 GQA 2, global head 512 GQA 8). No model needed.
 #
@@ -10,7 +10,7 @@ cd "$(dirname "$0")/../.."
 
 BIN=${1:-build-dpp}/bin
 
-for RUN in "0 1" "2 1" "3 1" "3 0"; do
+for RUN in "0 1" "2 1" "3 1" "0 0" "2 0" "3 0"; do
     set -- ${RUN}
     CFG=$1
     PIPE=$2

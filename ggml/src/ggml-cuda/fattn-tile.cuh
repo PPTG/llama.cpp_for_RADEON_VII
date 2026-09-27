@@ -413,8 +413,8 @@ static __host__ uint32_t ggml_cuda_fattn_tile_get_config_cfg(const int DKQ, cons
     return cfg % 100 != 0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg % 100) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols, cc);
 }
 
-// variant from GGML_CUDA_FA_Q8_CFG, else the fastest on gfx906 (fa-q8-cfg.sh): occupancy 3 for head 512,
-// 128 K columns per step for head 256
+// variant from GGML_CUDA_FA_Q8_CFG, else the fastest on gfx906 (fa-q8-cfg.sh): occupancy 3 for head 512; for head 256
+// the normal config with the prefetch pipeline (24 us for the Gemma 4 SWA layers), 128 K columns per step without it
 static bool ggml_cuda_fattn_tile_q8_pipe_env() {
     static const bool pipe = [] {
         const char * env = getenv("GGML_CUDA_FA_Q8_PIPE");
@@ -432,7 +432,7 @@ static int ggml_cuda_fattn_tile_q8_cfg_env(const int DKQ) {
         return cfg;
     }
 #ifdef GGML_USE_HIP
-    return DKQ == 512 ? 3 : 2;
+    return DKQ == 512 ? 3 : (ggml_cuda_fattn_tile_q8_pipe_env() ? 0 : 2);
 #else
     GGML_UNUSED(DKQ);
     return 0;
