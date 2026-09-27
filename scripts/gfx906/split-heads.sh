@@ -30,6 +30,6 @@ echo
 echo "=== tg32"
 for S in 0 1; do
     echo "--- LLAMA_KV_SPLIT_HEADS=${S}"
-    LLAMA_KV_SPLIT_HEADS=${S} "${BIN}/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -sm layer -ctk q8_0 -ctv q8_0 -p 0 -n 32 -r 2 \
+    LLAMA_KV_SPLIT_HEADS=${S} "${BIN}/llama-bench" -m "${MODEL}" -ngl 99 -fa 1 -sm layer -ctk q8_0 -ctv q8_0 -p 0 -n 32 -r 3 \
         -d "${DEPTHS}" 2>&1 | grep -E "tg32|error|abort"
 done

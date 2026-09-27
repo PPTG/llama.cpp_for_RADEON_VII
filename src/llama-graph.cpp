@@ -2835,16 +2835,12 @@ ggml_tensor * llm_graph_context::build_attn_split_heads(
     ggml_tensor * cur0 = curs[0];
     ggml_tensor * cur1 = curs[1];
 
-    // The scheduler copies the inputs of a graph split before its ops are queued. If the join were in the same split as
-    // the attention of the first part, the device of the layer would wait for the other device before starting its own
-    // attention. A no-op on the other device after the first attention puts the join into its own split.
-    cur1 = ggml_scale(ctx0, cur1, 1.0f);
-    pin(cur1, 1);
-    ggml_build_forward_expand(gf, cur1);
-
-    // [n_embd_head_v*n_head_q, n_tokens], on the device of the layer
+    // [n_embd_head_v*n_head_q, n_tokens]
+    // The join runs on the other device: the scheduler copies the inputs of a graph split before queueing its ops, so a
+    // join on the device of the layer (in the split of the first attention) would make it wait for the other device
+    // before starting its own attention. On the other device, the wait for the first part is a GPU side event wait.
     ggml_tensor * cur = ggml_concat(ctx0, cur0, cur1, 0);
-    pin(cur, 0);
+    pin(cur, 1);
     ggml_build_forward_expand(gf, cur);
 
     return cur;
