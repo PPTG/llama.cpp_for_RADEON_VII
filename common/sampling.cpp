@@ -15,6 +15,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
 template<typename T>
@@ -120,6 +124,78 @@ struct common_sampler {
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
+
+    // Fast path for CPU sampling (e.g. with a grammar): when the samplers in front of top-k only lower single logits
+    // (penalties, negative logit biases) or raise known tokens (positive logit biases), the chain gives the same result
+    // on the top (top_k + fast_margin) logits plus fast_extra as on the whole vocabulary (262144 tokens for Gemma:
+    // building the candidates and the top-k over them cost ~0.5 ms per token).
+    int32_t fast_top_k  = 0; // 0: disabled
+    int32_t fast_margin = 0;
+    std::vector<llama_token> fast_extra;
+
+    // candidates: the n largest logits (a min-heap, most logits are rejected by one compare) plus fast_extra
+    bool set_logits_top(struct llama_context * ctx, int idx) {
+        const llama_model * model = llama_get_model(ctx);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        const int n = fast_top_k + fast_margin;
+        if (n >= n_vocab || llama_get_sampled_logits_ith(ctx, idx) || llama_get_sampled_probs_ith(ctx, idx)) {
+            return false;
+        }
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+
+        cur.resize(n);
+        auto cmp = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
+        for (int i = 0; i < n; ++i) {
+            cur[i] = llama_token_data{i, logits[i], 0.0f};
+        }
+        std::make_heap(cur.begin(), cur.end(), cmp);
+        float thr = cur.front().logit;
+        auto push = [&](const int i) {
+            if (logits[i] > thr) {
+                std::pop_heap(cur.begin(), cur.end(), cmp);
+                cur.back() = llama_token_data{i, logits[i], 0.0f};
+                std::push_heap(cur.begin(), cur.end(), cmp);
+                thr = cur.front().logit;
+            }
+        };
+        int i = n;
+#if defined(__SSE2__)
+        // blocks of 16 logits below the threshold are skipped with 4 compares
+        for (; i + 16 <= n_vocab; i += 16) {
+            const __m128 t = _mm_set1_ps(thr);
+            const __m128 m = _mm_or_ps(
+                _mm_or_ps(_mm_cmpgt_ps(_mm_loadu_ps(logits + i +  0), t), _mm_cmpgt_ps(_mm_loadu_ps(logits + i +  4), t)),
+                _mm_or_ps(_mm_cmpgt_ps(_mm_loadu_ps(logits + i +  8), t), _mm_cmpgt_ps(_mm_loadu_ps(logits + i + 12), t)));
+            if (_mm_movemask_ps(m)) {
+                for (int j = 0; j < 16; ++j) {
+                    push(i + j);
+                }
+            }
+        }
+#endif // defined(__SSE2__)
+        for (; i < n_vocab; ++i) {
+            push(i);
+        }
+        for (const llama_token t : fast_extra) {
+            if (t < 0 || t >= n_vocab) {
+                continue;
+            }
+            bool found = false;
+            for (int i = 0; i < n; ++i) {
+                if (cur[i].id == t) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                cur.push_back(llama_token_data{t, logits[t], 0.0f});
+            }
+        }
+
+        cur_p = { cur.data(), cur.size(), -1, false };
+        return true;
+    }
 
     void reset() {
         prev.clear();
@@ -323,8 +399,8 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    std::vector<llama_logit_bias> merged = params.logit_bias;
     {
-        std::vector<llama_logit_bias> merged = params.logit_bias;
 
         int32_t n_suppress = 0;
         const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
@@ -432,7 +508,61 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .fast_top_k  = */ 0,
+        /* .fast_margin = */ 0,
+        /* .fast_extra  = */ {},
     };
+
+    // fast path for the CPU sampling: only if every sampler in front of top-k lowers logits of at most a known number
+    // of tokens (see common_sampler::set_logits_top)
+    if (params.mirostat == 0 && params.top_k > 0 && !params.backend_sampling) {
+        const char * env = getenv("LLAMA_SAMPLING_FAST_TOP_K");
+        bool ok = env == nullptr || atoi(env) != 0;
+        int32_t margin = 0;
+        std::vector<llama_token> extra;
+        for (const auto & lb : merged) {
+            if (lb.bias > 0.0f) {
+                extra.push_back(lb.token);
+            } else if (lb.bias < 0.0f) {
+                margin++;
+            }
+        }
+        bool has_top_k = false;
+        for (const auto & cnstr : params.samplers) {
+            if (!ok || cnstr == COMMON_SAMPLER_TYPE_TOP_K) {
+                has_top_k = cnstr == COMMON_SAMPLER_TYPE_TOP_K;
+                break;
+            }
+            switch (cnstr) {
+                case COMMON_SAMPLER_TYPE_PENALTIES: {
+                    const bool neutral = params.penalty_last_n == 0 ||
+                        (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f);
+                    if (neutral) {
+                        break;
+                    }
+                    // the penalties only lower logits, of at most penalty_last_n distinct tokens
+                    ok = params.penalty_last_n > 0 && params.penalty_repeat >= 1.0f &&
+                        params.penalty_freq >= 0.0f && params.penalty_present >= 0.0f;
+                    margin += params.penalty_last_n;
+                    break;
+                }
+                case COMMON_SAMPLER_TYPE_DRY:
+                    ok = params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0;
+                    break;
+                case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                    ok = params.top_n_sigma <= 0.0f;
+                    break;
+                default:
+                    ok = false;
+                    break;
+            }
+        }
+        if (ok && has_top_k && params.top_k + margin + (int32_t) extra.size() <= 4096) {
+            result->fast_top_k  = params.top_k;
+            result->fast_margin = margin;
+            result->fast_extra  = std::move(extra);
+        }
+    }
 
     return result;
 }
@@ -515,6 +645,9 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .fast_top_k  = */ gsmpl->fast_top_k,
+        /* .fast_margin = */ gsmpl->fast_margin,
+        /* .fast_extra  = */ gsmpl->fast_extra,
     };
 }
 
@@ -535,6 +668,9 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->fast_top_k  = src->fast_top_k;
+    dst->fast_margin = src->fast_margin;
+    dst->fast_extra  = src->fast_extra;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -604,7 +740,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // the fast path needs the whole chain after the grammar and the reasoning budget, which are applied to all tokens
+    const bool fast = gsmpl->fast_top_k > 0 && !(grammar_first && grammar_should_apply(gsmpl)) &&
+        (!rbudget || common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING) &&
+        gsmpl->set_logits_top(ctx, idx);
+    if (!fast) {
+        gsmpl->set_logits(ctx, idx);
+    }
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
