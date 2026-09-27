@@ -2,7 +2,7 @@
 # Quick round check: correctness of the fused/changed ops vs CPU, tg speed on 1 and 2 GPUs, kernel profile.
 #
 # usage: scripts/gfx906/check.sh [model.gguf] [build-dir]
-# env: SKIP_TESTS=1, SKIP_BENCH=1, SKIP_PROFILE=1
+# env: SKIP_TESTS=1, SKIP_TEXT=1, SKIP_BENCH=1, SKIP_PROFILE=1
 set -uo pipefail
 
 ROCM_PATH=${ROCM_PATH:-/opt/rocm}
@@ -16,11 +16,38 @@ BIN=${BUILD_DIR}/bin
 
 if [ -z "${SKIP_TESTS:-}" ]; then
 echo "=== correctness vs CPU"
-for OP in MUL_MAT MUL_MAT_ID MUL_MAT_VEC_FUSION MUL_MAT_VEC_FUSION_MERGED; do
+for OP in MUL_MAT MUL_MAT_ID MUL_MAT_VEC_FUSION MUL_MAT_VEC_FUSION_MERGED MUL_MAT_MULTI RMS_NORM_SCALE_MUL RMS_NORM_MUL_ADD MOE_REDUCE; do
     R=$("${BIN}/test-backend-ops" -b ROCm0 -o "${OP}" 2>&1 | tee "/tmp/check-${OP}.log" | grep -E "tests passed" | tail -n 1)
     echo "${OP}: ${R}"
     grep -m 5 "FAIL" "/tmp/check-${OP}.log"
 done
+fi
+
+if [ -z "${SKIP_TEXT:-}" ]; then
+echo
+echo "=== output check (greedy, 64 tokens, 1 GPU)"
+PROMPT="Explain in a few sentences how a GPU executes a matrix multiplication."
+gen() {
+    env "$@" "${BIN}/llama-completion" -m "${MODEL}" -ngl 99 -fa on -sm none -no-cnv --temp 0 -n 64 -p "${PROMPT}" \
+        --no-display-prompt 2>/dev/null
+}
+REF=$(gen GGML_CUDA_FUSE_QKV=0)
+OUT=$(gen)
+if [ -n "${OUT}" ] && [ "${OUT}" == "${REF}" ]; then
+    echo "OK   QKV multi MMVQ == separate"
+else
+    echo "DIFF QKV multi MMVQ != separate"
+    echo "--- separate: $(echo "${REF}" | head -c 300)"
+    echo "--- multi:    $(echo "${OUT}" | head -c 300)"
+fi
+NOFUSE=$(gen GGML_CUDA_DISABLE_FUSION=1)
+if [ "${OUT}" == "${NOFUSE}" ]; then
+    echo "OK   all fusions == no fusions"
+else
+    echo "INFO all fusions != no fusions (upstream fusions may round differently), first 200 chars:"
+    echo "--- no fusion: $(echo "${NOFUSE}" | head -c 200)"
+    echo "--- fusion:    $(echo "${OUT}" | head -c 200)"
+fi
 fi
 
 if [ -z "${SKIP_BENCH:-}" ]; then

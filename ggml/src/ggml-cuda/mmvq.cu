@@ -651,7 +651,15 @@ static constexpr __host__ __device__ int mmvq_rows_per_block(ggml_type type, int
         calc_rows_per_block(ncols_dst, table_id, small_k, calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters));
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int variant = 0>
+// Up to 3 matrices with the same src1, K and type in one launch (e.g. Q, K, V). The blocks of all matrices are
+// concatenated along x, row_end holds the cumulative row counts.
+struct ggml_cuda_mmvq_multi_args {
+    const void * vx[3]      = {nullptr, nullptr, nullptr};
+    float *      dst[3]     = {nullptr, nullptr, nullptr};
+    uint32_t     row_end[3] = {0, 0, 0};
+};
+
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int variant = 0, bool multi = false>
 __launch_bounds__(mmvq_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters, variant)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -659,11 +667,31 @@ static __global__ void mul_mat_vec_q(
         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const uint32_t ids_stride) {
-    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+        const uint32_t ids_stride, const ggml_cuda_mmvq_multi_args multi_args) {
+    static_assert(!multi || (ncols_dst == 1 && !has_fusion), "multi is only supported for ncols_dst == 1 without fusion");
+
+    constexpr int rows_per_cuda_block_m = mmvq_rows_per_block(type, ncols_dst, get_device_table_id(), small_k, halve_iters, variant);
+
+    // matrix of this block, its first row and its row count (multi) or the single matrix
+    int      row0_m  = rows_per_cuda_block_m*blockIdx.x;
+    uint32_t nrows_m = stride_col_dst;
+    const void * vx_m  = vx_ptr;
+    float *      dst_m = dst_ptr;
+    if constexpr (multi) {
+        int      m     = 0;
+        uint32_t start = 0;
+        if ((uint32_t) row0_m >= multi_args.row_end[0]) { m = 1; start = multi_args.row_end[0]; }
+        if ((uint32_t) row0_m >= multi_args.row_end[1]) { m = 2; start = multi_args.row_end[1]; }
+        vx_m    = multi_args.vx[m];
+        dst_m   = multi_args.dst[m];
+        row0_m -= start;
+        nrows_m = multi_args.row_end[m] - start;
+    }
+
+    const void    * GGML_CUDA_RESTRICT vx  = vx_m;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
-    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_m;
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -676,7 +704,7 @@ static __global__ void mul_mat_vec_q(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int row0 = row0_m;
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -854,7 +882,7 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 
-            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_m)) {
                 float result = tmp[j][i];
                 if constexpr (has_fusion) {
                     if constexpr (type == GGML_TYPE_NVFP4) {
@@ -1081,7 +1109,7 @@ static void mul_mat_vec_q_switch_fusion(
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, variant>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ggml_cuda_mmvq_multi_args{});
             return;
         }
     }
@@ -1092,7 +1120,7 @@ static void mul_mat_vec_q_switch_fusion(
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, variant>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ggml_cuda_mmvq_multi_args{});
 }
 
 template <ggml_type type>
@@ -1527,6 +1555,59 @@ static bool ggml_cuda_mmvq_use_q8_cache() {
     return use;
 }
 
+// Quantize src1 to Q8_1 for MMVQ, or reuse the Q8_1 data of the previous MMVQ in this graph compute if it had the same src1.
+// src1 is still used by the current op, so its data can not have been overwritten in between.
+static char * ggml_cuda_mmvq_quantize_src1(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const ggml_type type_src0, const bool allow_cache,
+        ggml_cuda_pool_alloc<char> & src1_q8_1_pool) {
+    GGML_TENSOR_LOCALS(int64_t, ne1, src1, ne);
+    cudaStream_t stream = ctx.stream();
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const float * src1_d = (const float *) src1->data;
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    ggml_cuda_mmvq_q8_cache & q8_cache = ctx.mmvq_q8_cache;
+    bool use_q8_cache = ggml_cuda_mmvq_use_q8_cache() && allow_cache;
+    if (use_q8_cache && q8_cache.size < q8_1_size) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (q8_cache.buf != nullptr) {
+                CUDA_CHECK(cudaFree(q8_cache.buf));
+            }
+            q8_cache.size = std::max(q8_1_size, (size_t) 64*1024);
+            CUDA_CHECK(cudaMalloc(&q8_cache.buf, q8_cache.size));
+            q8_cache.reset();
+        } else {
+            use_q8_cache = false;
+        }
+    }
+
+    const bool q8_cache_hit = use_q8_cache && q8_cache.src1 == src1 && q8_cache.data == src1->data && q8_cache.stream == stream &&
+        memcmp(q8_cache.ne, src1->ne, sizeof(q8_cache.ne)) == 0 && memcmp(q8_cache.nb, src1->nb, sizeof(q8_cache.nb)) == 0;
+
+    char * src1_q8_1_ptr = use_q8_cache ? (char *) q8_cache.buf : src1_q8_1_pool.alloc(q8_1_size);
+
+    if (!q8_cache_hit) {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, type_src0, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+
+        if (use_q8_cache) {
+            q8_cache.src1   = src1;
+            q8_cache.data   = src1->data;
+            q8_cache.stream = stream;
+            memcpy(q8_cache.ne, src1->ne, sizeof(q8_cache.ne));
+            memcpy(q8_cache.nb, src1->nb, sizeof(q8_cache.nb));
+        }
+    }
+    return src1_q8_1_ptr;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1607,48 +1688,8 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
-
-    // Reuse the Q8_1 data if the previous MMVQ in this graph compute quantized the same src1.
-    // src1 is still used by this op, so its data can not have been overwritten in between.
-    ggml_cuda_mmvq_q8_cache & q8_cache = ctx.mmvq_q8_cache;
-    bool use_q8_cache = ggml_cuda_mmvq_use_q8_cache() && ids == nullptr;
-    if (use_q8_cache && q8_cache.size < q8_1_size) {
-        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
-        if (capture_status == cudaStreamCaptureStatusNone) {
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            if (q8_cache.buf != nullptr) {
-                CUDA_CHECK(cudaFree(q8_cache.buf));
-            }
-            q8_cache.size = std::max(q8_1_size, (size_t) 64*1024);
-            CUDA_CHECK(cudaMalloc(&q8_cache.buf, q8_cache.size));
-            q8_cache.reset();
-        } else {
-            use_q8_cache = false;
-        }
-    }
-
-    const bool q8_cache_hit = use_q8_cache && q8_cache.src1 == src1 && q8_cache.data == src1->data && q8_cache.stream == stream &&
-        memcmp(q8_cache.ne, src1->ne, sizeof(q8_cache.ne)) == 0 && memcmp(q8_cache.nb, src1->nb, sizeof(q8_cache.nb)) == 0;
-
     ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
-    char * src1_q8_1_ptr = use_q8_cache ? (char *) q8_cache.buf : src1_q8_1_pool.alloc(q8_1_size);
-
-    if (!q8_cache_hit) {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-
-        if (use_q8_cache) {
-            q8_cache.src1   = src1;
-            q8_cache.data   = src1->data;
-            q8_cache.stream = stream;
-            memcpy(q8_cache.ne, src1->ne, sizeof(q8_cache.ne));
-            memcpy(q8_cache.nb, src1->nb, sizeof(q8_cache.nb));
-        }
-    }
+    char * src1_q8_1_ptr = ggml_cuda_mmvq_quantize_src1(ctx, src1, src0->type, ids == nullptr, src1_q8_1_pool);
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -1708,4 +1749,95 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_multi_launch(const ggml_cuda_mmvq_multi_args & multi_args, const void * vy, const int ncols_x,
+        const int stride_row_x, const int stride_col_y, const int64_t nrows_total, const int warp_size, cudaStream_t stream) {
+    constexpr int variant = MMVQ_GCN_DEFAULT_VARIANT;
+    const dim3 block_nums(nrows_total / mmvq_variant_rows(variant), 1, 1);
+    const dim3 block_dims(warp_size, mmvq_variant_nwarps(variant), 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    const uint3 one_fd = init_fastdiv_values(1);
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, 1, false, false, false, variant, true>, launch_params,
+        multi_args.vx[0], vy, (const int32_t *) nullptr, ggml_cuda_mm_fusion_args_device{}, multi_args.dst[0],
+        (uint32_t) ncols_x, make_uint3(0, 0, 0), (uint32_t) stride_row_x, (uint32_t) stride_col_y,
+        multi_args.row_end[0], one_fd, 0u, 0u, 0u, one_fd, 0u, 0u, 0u, 0u, multi_args);
+}
+
+bool ggml_cuda_mul_mat_vec_q_multi_supported(const ggml_tensor * const * src0s, const ggml_tensor * const * dsts, const int n,
+        const ggml_tensor * src1) {
+    if (n < 2 || n > 3) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_GCN(cc) || !mmvq_variant_type_supported(src0s[0]->type)) {
+        return false;
+    }
+    // only for the default GCN variant, the kernel is only compiled for it
+    const char * env = getenv("GGML_HIP_MMVQ_VARIANT");
+    if (env != nullptr && atoi(env) != MMVQ_GCN_DEFAULT_VARIANT) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->nb[0] != sizeof(float)) {
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * src0 = src0s[i];
+        const ggml_tensor * dst  = dsts[i];
+        if (src0->type != src0s[0]->type || src0->ne[0] != src1->ne[0] || src0->nb[1] != src0s[0]->nb[1] ||
+                src0->ne[2] != 1 || src0->ne[3] != 1 || src0->nb[0] != ggml_type_size(src0->type) ||
+                src0->ne[1] % mmvq_variant_rows(MMVQ_GCN_DEFAULT_VARIANT) != 0 ||
+                ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+                dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->ne[0] != src0->ne[1] || ggml_nrows(dst) != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0s, ggml_tensor * const * dsts,
+        const int n, const ggml_tensor * src1) {
+    GGML_ASSERT(ggml_cuda_mul_mat_vec_q_multi_supported(src0s, dsts, n, src1));
+
+    ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
+    const char * src1_q8_1 = ggml_cuda_mmvq_quantize_src1(ctx, src1, src0s[0]->type, true, src1_q8_1_pool);
+
+    ggml_cuda_mmvq_multi_args multi_args;
+    uint32_t row_end = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (i < n) {
+            row_end += src0s[i]->ne[1];
+            multi_args.vx[i]  = src0s[i]->data;
+            multi_args.dst[i] = (float *) dsts[i]->data;
+        }
+        multi_args.row_end[i] = row_end;
+    }
+
+    const ggml_type type         = src0s[0]->type;
+    const int       ncols_x      = src0s[0]->ne[0];
+    const int       stride_row_x = src0s[0]->nb[1] / ggml_type_size(type);
+    const int       stride_col_y = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) / QK8_1;
+    const int       warp_size    = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    cudaStream_t    stream       = ctx.stream();
+
+    GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
+
+    switch (type) {
+#define MMVQ_MULTI_CASE(t) case t: mul_mat_vec_q_multi_launch<t>(multi_args, src1_q8_1, ncols_x, stride_row_x, stride_col_y, row_end, warp_size, stream); break;
+        MMVQ_MULTI_CASE(GGML_TYPE_Q4_0)
+        MMVQ_MULTI_CASE(GGML_TYPE_Q4_1)
+        MMVQ_MULTI_CASE(GGML_TYPE_Q5_0)
+        MMVQ_MULTI_CASE(GGML_TYPE_Q5_1)
+        MMVQ_MULTI_CASE(GGML_TYPE_Q8_0)
+        MMVQ_MULTI_CASE(GGML_TYPE_MXFP4)
+        MMVQ_MULTI_CASE(GGML_TYPE_Q4_K)
+        MMVQ_MULTI_CASE(GGML_TYPE_Q5_K)
+        MMVQ_MULTI_CASE(GGML_TYPE_Q6_K)
+        MMVQ_MULTI_CASE(GGML_TYPE_IQ4_NL)
+        MMVQ_MULTI_CASE(GGML_TYPE_IQ4_XS)
+#undef MMVQ_MULTI_CASE
+        default:
+            GGML_ABORT("unsupported type for multi MMVQ");
+    }
 }

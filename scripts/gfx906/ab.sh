@@ -18,7 +18,8 @@ bench() {
 
 CONFIGS=(
     "all on (default)|"
-    "gate_up fusion on|GGML_CUDA_FUSE_GATE_UP=1"
+    "no QKV multi MMVQ|GGML_CUDA_FUSE_QKV=0"
+    "no fusions at all|GGML_CUDA_DISABLE_FUSION=1"
     "no Q8 cache|GGML_CUDA_MMVQ_Q8_CACHE=0"
     "upstream MMVQ|GGML_HIP_MMVQ_VARIANT=0"
     "MMVQ variant 3|GGML_HIP_MMVQ_VARIANT=3"

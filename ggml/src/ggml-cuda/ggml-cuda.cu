@@ -3603,6 +3603,29 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// GGML_CUDA_FUSE_QKV=0/1: run consecutive mul_mat with the same src1 (Q, K, V) as one MMVQ launch, and move them next to
+// each other in graph_optimize. Default on for HIP.
+static bool ggml_cuda_fuse_qkv_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_QKV");
+        if (env != nullptr) {
+            return atoi(env) != 0;
+        }
+#ifdef GGML_USE_HIP
+        return true;
+#else
+        return false;
+#endif // GGML_USE_HIP
+    }();
+    return enabled;
+}
+
+// mul_mat that can take part in a multi MMVQ launch: quantized weights, single token
+static bool ggml_cuda_is_multi_mmvq_candidate(const ggml_tensor * node) {
+    return node->op == GGML_OP_MUL_MAT && ggml_is_quantized(node->src[0]->type) && node->src[0]->op == GGML_OP_NONE &&
+        node->src[1]->type == GGML_TYPE_F32 && node->src[1]->ne[1] == 1 && node->src[1]->ne[2] == 1 && node->src[1]->ne[3] == 1;
+}
+
 // GGML_CUDA_FUSE_GATE_UP=0/1: merged gate_up + glu fusion and the alloc deps that enable mm + glu fusions.
 // Default off on HIP: on gfx906 the fused kernel needs 2x the registers and is ~5% slower in tg (Gemma 4 26B A4B).
 static bool ggml_cuda_fuse_gate_up_enabled() {
@@ -4269,6 +4292,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Q, K, V (or any consecutive mul_mat with the same src1) as one MMVQ launch
+    if (ggml_cuda_fuse_qkv_enabled() && ggml_cuda_is_multi_mmvq_candidate(node)) {
+        const ggml_tensor * src0s[3] = { node->src[0], nullptr, nullptr };
+        ggml_tensor *       dsts[3]  = { node, nullptr, nullptr };
+        int n = 1;
+        while (n < 3 && i + n < cgraph->n_nodes) {
+            ggml_tensor * next = cgraph->nodes[i + n];
+            if (!ggml_cuda_is_multi_mmvq_candidate(next) || next->src[1] != node->src[1]) {
+                break;
+            }
+            src0s[n] = next->src[0];
+            dsts[n]  = next;
+            n++;
+        }
+        if (n >= 2 && ggml_cuda_mul_mat_vec_q_multi_supported(src0s, dsts, n, node->src[1])) {
+            ggml_cuda_mul_mat_vec_q_multi(*cuda_ctx, src0s, dsts, n, node->src[1]);
+            return n - 1;
+        }
+    }
+
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
@@ -4807,6 +4850,33 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+
+    // Move mul_mat nodes that share src1 with an earlier mul_mat (e.g. K and V after Q) right behind it, so they can run
+    // as one MMVQ launch. This is valid because such a node only depends on its weights and on src1, which is computed
+    // before the first mul_mat. The allocator then sees the new order.
+    if (!disable_fusion && ggml_cuda_fuse_qkv_enabled()) {
+        constexpr int max_lookahead = 32;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * first = cgraph->nodes[i];
+            if (!ggml_cuda_is_multi_mmvq_candidate(first)) {
+                continue;
+            }
+            int group_end = i + 1; // next free position in the group
+            for (int j = i + 1; j < cgraph->n_nodes && j <= i + max_lookahead && group_end - i < 3; ++j) {
+                ggml_tensor * cand = cgraph->nodes[j];
+                if (!ggml_cuda_is_multi_mmvq_candidate(cand) || cand->src[1] != first->src[1] ||
+                        cand->src[0]->type != first->src[0]->type || cand->src[0]->ne[0] != first->src[0]->ne[0]) {
+                    continue;
+                }
+                if (j != group_end) {
+                    memmove(&cgraph->nodes[group_end + 1], &cgraph->nodes[group_end], (j - group_end) * sizeof(ggml_tensor *));
+                    cgraph->nodes[group_end] = cand;
+                }
+                group_end++;
+            }
+            i = group_end - 1;
+        }
+    }
 
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 
