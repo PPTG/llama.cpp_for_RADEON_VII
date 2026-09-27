@@ -773,11 +773,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-// GGML_CUDA_FA_LOG=1: print the shapes, strides and the kernel of each FLASH_ATTN_EXT call (first 200 calls)
+// GGML_CUDA_FA_LOG=1: print the shapes, strides and the kernel of FLASH_ATTN_EXT calls with batch size <= 2 (token
+// generation, first 200 calls)
 static void ggml_cuda_flash_attn_ext_log(const ggml_tensor * dst, const int kernel) {
     static const bool enabled = getenv("GGML_CUDA_FA_LOG") != nullptr && atoi(getenv("GGML_CUDA_FA_LOG")) != 0;
     static int n_logged = 0;
-    if (!enabled || n_logged >= 200) {
+    if (!enabled || n_logged >= 200 || dst->src[0]->ne[1] > 2) {
         return;
     }
     n_logged++;
