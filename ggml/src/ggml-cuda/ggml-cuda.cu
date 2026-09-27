@@ -218,6 +218,9 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+// set by ggml_cuda_init when GGML_CUDA_PEER_COPY=1 and all devices have peer access to each other
+static bool ggml_cuda_peer_copy_available = false;
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -382,6 +385,36 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
+
+    // GGML_CUDA_PEER_COPY=1: small copies between GPUs are done by a kernel that writes into the memory of the other GPU
+    // (see ggml_cuda_peer_copy), which needs peer access between all devices
+    {
+        const char * env = getenv("GGML_CUDA_PEER_COPY");
+        if (env != nullptr && atoi(env) != 0 && info.physical_device_count > 1) {
+            bool ok = true;
+            for (int id = 0; id < info.physical_device_count && ok; ++id) {
+                CUDA_CHECK(cudaSetDevice(id));
+                for (int id_other = 0; id_other < info.physical_device_count; ++id_other) {
+                    if (id == id_other) {
+                        continue;
+                    }
+                    int can_access_peer = 0;
+                    CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id, id_other));
+                    const cudaError_t err = can_access_peer ? cudaDeviceEnablePeerAccess(id_other, 0) : cudaSuccess;
+                    if (!can_access_peer || (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled)) {
+                        GGML_LOG_WARN("%s: no peer access from device %d to %d, GGML_CUDA_PEER_COPY disabled\n", __func__, id, id_other);
+                        ok = false;
+                        break;
+                    }
+                }
+                (void) cudaGetLastError();
+            }
+            ggml_cuda_peer_copy_available = ok;
+            if (ok) {
+                GGML_LOG_INFO("%s: small copies between GPUs by peer writes (GGML_CUDA_PEER_COPY)\n", __func__);
+            }
+        }
+    }
 
     if (getenv("GGML_CUDA_P2P") != nullptr) {
         for (int id = 0; id < info.physical_device_count; ++id) {
@@ -2561,6 +2594,35 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
     ggml_cuda_set_device(ctx_src->device);
 }
 
+// Copy to the memory of another GPU by a kernel on the source stream: one launch instead of a D2H and a H2D copy through
+// pinned host memory, for the small tensors that go between the GPUs in token generation.
+static __global__ void ggml_cuda_peer_copy_kernel(const char * __restrict__ src, char * __restrict__ dst, const size_t nbytes) {
+    const size_t tid     = (size_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const size_t nthread = (size_t) gridDim.x*blockDim.x;
+    const size_t n16     = nbytes / 16;
+    for (size_t i = tid; i < n16; i += nthread) {
+        ((int4 *) dst)[i] = ((const int4 *) src)[i];
+    }
+    for (size_t i = n16*16 + tid; i < nbytes; i += nthread) {
+        dst[i] = src[i];
+    }
+    // make the writes to the other GPU visible before the event the other stream waits for
+    __threadfence_system();
+}
+
+static bool ggml_cuda_peer_copy(ggml_backend_cuda_context * ctx_src, void * dst, const void * src, const size_t nbytes) {
+    constexpr size_t max_bytes = 1024*1024;
+    if (!ggml_cuda_peer_copy_available || nbytes > max_bytes || (uintptr_t) src % 16 != 0 || (uintptr_t) dst % 16 != 0) {
+        return false;
+    }
+    const int nthreads = 256;
+    const int nblocks  = (int) std::min<size_t>((nbytes/16 + nthreads - 1) / nthreads + 1, 64);
+    ggml_cuda_set_device(ctx_src->device);
+    ggml_cuda_peer_copy_kernel<<<nblocks, nthreads, 0, ctx_src->stream()>>>((const char *) src, (char *) dst, nbytes);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -2595,6 +2657,8 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        } else if (ggml_cuda_peer_copy(cuda_ctx_src, dst->data, src->data, ggml_nbytes(dst))) {
+            // done on the src stream, the event below orders it with the dst stream
         } else if (ggml_cuda_use_staged_copy()) {
             ggml_cuda_staged_copy(cuda_ctx_src, cuda_ctx_dst, dst->data, src->data, ggml_nbytes(dst));
             return true;
