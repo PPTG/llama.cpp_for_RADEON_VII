@@ -1371,6 +1371,31 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
         }
     }
 
+    // Pre-filter by the first code point: a token whose first code point matches the top of no stack is rejected by
+    // llama_grammar_reject_candidates, without decoding the whole token into a vector (262144 tokens: ~18 -> ~2 ms).
+    // Only if every non-empty stack has a char element on top and no partial UTF-8 sequence is pending.
+    static const bool prefilter_env = [] {
+        const char * env = getenv("LLAMA_GRAMMAR_PREFILTER");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    bool prefilter = prefilter_env && grammar.partial_utf8.n_remain == 0;
+    for (const auto & stack : grammar.stacks) {
+        if (!stack.empty()) {
+            const auto type = stack.back()->type;
+            prefilter = prefilter && (type == LLAMA_GRETYPE_CHAR || type == LLAMA_GRETYPE_CHAR_NOT || type == LLAMA_GRETYPE_CHAR_ANY);
+        }
+    }
+    auto first_cp_matches = [&](const uint32_t chr) {
+        for (const auto & stack : grammar.stacks) {
+            if (!stack.empty() && llama_grammar_match_char(stack.back(), chr).first) {
+                return true;
+            }
+        }
+        return false;
+    };
+    int8_t ascii_ok[128];
+    std::fill(ascii_ok, ascii_ok + 128, (int8_t) -1);
+
     std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
     candidates_decoded.reserve(cur_p->size);
 
@@ -1386,6 +1411,32 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
                 cur_p->data[i].logit = -INFINITY;
             }
         } else if (piece.empty() || piece[0] == 0) {
+            cur_p->data[i].logit = -INFINITY;
+        } else if (prefilter && [&] {
+                // first code point as decode_utf8 computes it; invalid or incomplete sequences go the full way
+                const uint8_t b0 = static_cast<uint8_t>(piece[0]);
+                if (b0 < 0x80) {
+                    if (ascii_ok[b0] < 0) {
+                        ascii_ok[b0] = first_cp_matches(b0) ? 1 : 0;
+                    }
+                    return ascii_ok[b0] == 0;
+                }
+                if (b0 < 0xC0) {
+                    return false;
+                }
+                const int len = b0 < 0xE0 ? 2 : (b0 < 0xF0 ? 3 : 4);
+                if ((int) piece.size() < len) {
+                    return false;
+                }
+                uint32_t chr = b0 & ((1 << (8 - len)) - 1);
+                for (int k = 1; k < len; ++k) {
+                    if (piece[k] == 0) {
+                        return false;
+                    }
+                    chr = (chr << 6) + (static_cast<uint8_t>(piece[k]) & 0x3F);
+                }
+                return !first_cp_matches(chr);
+            }()) {
             cur_p->data[i].logit = -INFINITY;
         } else {
             candidates_decoded.push_back(decode_utf8(piece, grammar.partial_utf8));

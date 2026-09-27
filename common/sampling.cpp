@@ -132,6 +132,8 @@ struct common_sampler {
     int32_t fast_top_k  = 0; // 0: disabled
     int32_t fast_margin = 0;
     std::vector<llama_token> fast_extra;
+    int32_t fast_i_top_k = -1;   // index of top-k in the chain
+    float   fast_thr     = 0.0f; // smallest logit of the n largest (set by set_logits_top)
 
     // candidates: the n = fast_top_k + fast_margin + n_more largest logits (a min-heap, most logits are rejected by one
     // compare) in cur[0, n), then fast_extra
@@ -178,6 +180,7 @@ struct common_sampler {
         for (; i < n_vocab; ++i) {
             push(i);
         }
+        fast_thr = thr;
         for (const llama_token t : fast_extra) {
             if (t < 0 || t >= n_vocab) {
                 continue;
@@ -512,6 +515,8 @@ struct common_sampler * common_sampler_init(
         /* .fast_top_k  = */ 0,
         /* .fast_margin = */ 0,
         /* .fast_extra  = */ {},
+        /* .fast_i_top_k = */ -1,
+        /* .fast_thr     = */ 0.0f,
     };
 
     // fast path for the CPU sampling: only if every sampler in front of top-k lowers logits of at most a known number
@@ -558,7 +563,14 @@ struct common_sampler * common_sampler_init(
                     break;
             }
         }
+        int32_t i_top_k = -1;
+        for (int i = 0; i < llama_sampler_chain_n(chain); ++i) {
+            if (strcmp(llama_sampler_name(llama_sampler_chain_get(chain, i)), "top-k") == 0) {
+                i_top_k = i;
+            }
+        }
         if (ok && has_top_k && params.top_k + margin + (int32_t) extra.size() <= 4096) {
+            result->fast_i_top_k = i_top_k;
             result->fast_top_k  = params.top_k;
             result->fast_margin = margin;
             result->fast_extra  = std::move(extra);
@@ -649,6 +661,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .fast_top_k  = */ gsmpl->fast_top_k,
         /* .fast_margin = */ gsmpl->fast_margin,
         /* .fast_extra  = */ gsmpl->fast_extra,
+        /* .fast_i_top_k = */ gsmpl->fast_i_top_k,
+        /* .fast_thr     = */ gsmpl->fast_thr,
     };
 }
 
@@ -672,6 +686,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->fast_top_k  = src->fast_top_k;
     dst->fast_margin = src->fast_margin;
     dst->fast_extra  = src->fast_extra;
+    dst->fast_i_top_k = src->fast_i_top_k;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -803,24 +818,24 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
     bool resampled = false;
     if (gsmpl->fast_top_k > 0 && (!rbudget || common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING)) {
-        // the grammar only lowers logits too: if at least top_k + margin of the n largest logits are valid, no other
-        // token can get into the top-k and the chain gives the same result as on all logits (else: all logits; a
-        // second try with more logits cost more than it saved when few tokens are valid)
+        // the grammar only lowers logits too: every other token has a logit <= the smallest of the n largest, so if
+        // the k-th logit after the grammar and the samplers up to top-k is not smaller, the chain gives the same
+        // result as on all logits (else all logits: a second try with more logits cost more than it saved)
+        const int n_chain = llama_sampler_chain_n(chain);
         for (const int n_more : { 1024 }) {
-            if (!gsmpl->set_logits_top(ctx, idx, n_more)) {
+            if (gsmpl->fast_i_top_k < 0 || !gsmpl->set_logits_top(ctx, idx, n_more)) {
                 break;
             }
-            const int n_top = gsmpl->fast_top_k + gsmpl->fast_margin + n_more;
-
             llama_sampler_apply(rbudget, &cur_p);
             llama_sampler_apply(grmr,    &cur_p);
-
-            int n_valid = 0;
-            for (int i = 0; i < n_top; ++i) {
-                n_valid += cur_p.data[i].logit != -INFINITY;
+            for (int i = 0; i <= gsmpl->fast_i_top_k; ++i) {
+                llama_sampler_apply(llama_sampler_chain_get(chain, i), &cur_p);
             }
-            if (n_valid >= gsmpl->fast_top_k + gsmpl->fast_margin) {
-                llama_sampler_apply(chain, &cur_p);
+            const int k = gsmpl->fast_top_k;
+            if ((int) cur_p.size >= k && cur_p.data[k - 1].logit >= gsmpl->fast_thr) {
+                for (int i = gsmpl->fast_i_top_k + 1; i < n_chain; ++i) {
+                    llama_sampler_apply(llama_sampler_chain_get(chain, i), &cur_p);
+                }
                 resampled = true;
                 break;
             }
