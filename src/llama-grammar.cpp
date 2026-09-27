@@ -91,6 +91,62 @@ static std::pair<std::vector<uint32_t>, llama_partial_utf8> decode_utf8(
     return std::make_pair(std::move(code_points), llama_partial_utf8{ value, n_remain });
 }
 
+// same as decode_utf8 above, the code points (with the terminating 0) are appended to out: no allocation per token
+static llama_partial_utf8 decode_utf8_append(
+        const std::string & src,
+        llama_partial_utf8 partial_start,
+        std::vector<uint32_t> & out) {
+    static const int      lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4 };
+    const char          * pos      = src.c_str();
+    const size_t          start    = out.size();
+    uint32_t value    = partial_start.value;
+    int      n_remain = partial_start.n_remain;
+
+    while (*pos != 0 && n_remain > 0) {
+        uint8_t next_byte = static_cast<uint8_t>(*pos);
+        if ((next_byte >> 6) != 2) {
+            out.resize(start);
+            out.push_back(0);
+            return llama_partial_utf8{ 0, -1 };
+        }
+        value = (value << 6) + (next_byte & 0x3F);
+        ++pos;
+        --n_remain;
+    }
+
+    if (partial_start.n_remain > 0 && n_remain == 0) {
+        out.push_back(value);
+    }
+
+    while (*pos != 0) {
+        uint8_t first_byte = static_cast<uint8_t>(*pos);
+        uint8_t highbits   = first_byte >> 4;
+        n_remain   = lookup[highbits] - 1;
+
+        if (n_remain < 0) {
+            out.resize(start);
+            out.push_back(0);
+            return llama_partial_utf8{ 0, n_remain };
+        }
+
+        uint8_t mask  = (1 << (7 - n_remain)) - 1;
+        value = first_byte & mask;
+
+        ++pos;
+        while (*pos != 0 && n_remain > 0) {
+            value = (value << 6) + (static_cast<uint8_t>(*pos) & 0x3F);
+            ++pos;
+            --n_remain;
+        }
+        if (n_remain == 0) {
+            out.push_back(value);
+        }
+    }
+    out.push_back(0);
+
+    return llama_partial_utf8{ value, n_remain };
+}
+
 static bool is_digit_char(char c) {
     return '0' <= c && c <= '9';
 }
@@ -1364,40 +1420,57 @@ static constexpr uint32_t LLAMA_GRAMMAR_CP_EOG   = 0xFFFFFFFF; // end of generat
 static constexpr uint32_t LLAMA_GRAMMAR_CP_EMPTY = 0xFFFFFFFE; // empty piece or 0 byte first: always rejected
 static constexpr uint32_t LLAMA_GRAMMAR_CP_FULL  = 0xFFFFFFFD; // invalid or incomplete UTF-8: full check
 
+// one complete UTF-8 code point at p as decode_utf8 computes it, returns its length in bytes, 0 if invalid or incomplete
+static int llama_grammar_decode_one(const std::string & piece, size_t p, uint32_t & chr) {
+    if (p >= piece.size() || piece[p] == 0) {
+        return 0;
+    }
+    const uint8_t b0 = static_cast<uint8_t>(piece[p]);
+    if (b0 < 0x80) {
+        chr = b0;
+        return 1;
+    }
+    if (b0 < 0xC0) {
+        return 0;
+    }
+    const int len = b0 < 0xE0 ? 2 : (b0 < 0xF0 ? 3 : 4);
+    if (piece.size() < p + len) {
+        return 0;
+    }
+    chr = b0 & ((1 << (8 - len)) - 1);
+    for (int k = 1; k < len; ++k) {
+        if (piece[p + k] == 0) {
+            return 0;
+        }
+        chr = (chr << 6) + (static_cast<uint8_t>(piece[p + k]) & 0x3F);
+    }
+    return chr < LLAMA_GRAMMAR_CP_FULL ? len : 0;
+}
+
+// [2*id]: first code point of the token or EOG / EMPTY / FULL, [2*id + 1]: second code point or FULL
 static const std::vector<uint32_t> & llama_grammar_first_cps(const llama_grammar & grammar) {
     if (grammar.first_cps) {
         return *grammar.first_cps;
     }
     const llama_vocab * vocab = grammar.vocab;
-    std::vector<uint32_t> cps(vocab->n_tokens());
-    for (uint32_t id = 0; id < cps.size(); ++id) {
+    std::vector<uint32_t> cps(2*size_t(vocab->n_tokens()), LLAMA_GRAMMAR_CP_FULL);
+    for (uint32_t id = 0; id < vocab->n_tokens(); ++id) {
         const std::string & piece = vocab->token_to_piece(id);
-        uint32_t cp = LLAMA_GRAMMAR_CP_FULL;
         if (vocab->is_eog(id)) {
-            cp = LLAMA_GRAMMAR_CP_EOG;
+            cps[2*id] = LLAMA_GRAMMAR_CP_EOG;
         } else if (piece.empty() || piece[0] == 0) {
-            cp = LLAMA_GRAMMAR_CP_EMPTY;
+            cps[2*id] = LLAMA_GRAMMAR_CP_EMPTY;
         } else {
-            // first code point as decode_utf8 computes it
-            const uint8_t b0 = static_cast<uint8_t>(piece[0]);
-            if (b0 < 0x80) {
-                cp = b0;
-            } else if (b0 >= 0xC0) {
-                const int len = b0 < 0xE0 ? 2 : (b0 < 0xF0 ? 3 : 4);
-                if ((int) piece.size() >= len) {
-                    uint32_t chr = b0 & ((1 << (8 - len)) - 1);
-                    bool ok = true;
-                    for (int k = 1; k < len; ++k) {
-                        ok = ok && piece[k] != 0;
-                        chr = (chr << 6) + (static_cast<uint8_t>(piece[k]) & 0x3F);
-                    }
-                    if (ok && chr < LLAMA_GRAMMAR_CP_FULL) {
-                        cp = chr;
-                    }
+            uint32_t c1 = 0;
+            const int len1 = llama_grammar_decode_one(piece, 0, c1);
+            if (len1 > 0) {
+                cps[2*id] = c1;
+                uint32_t c2 = 0;
+                if (llama_grammar_decode_one(piece, len1, c2) > 0) {
+                    cps[2*id + 1] = c2;
                 }
             }
         }
-        cps[id] = cp;
     }
     grammar.first_cps = std::make_shared<const std::vector<uint32_t>>(std::move(cps));
     return *grammar.first_cps;
@@ -1418,8 +1491,9 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
         }
     }
 
-    // Pre-filter by the first code point: a token whose first code point matches the top of no stack is rejected by
-    // llama_grammar_reject_candidates, without decoding the whole token into a vector (262144 tokens: ~18 -> ~2 ms).
+    // Pre-filter by the first two code points: a token whose first code point matches the top of no stack, or whose
+    // second one matches no stack after the first, is rejected by llama_grammar_reject_candidates, without decoding
+    // the whole token.
     // Only if every non-empty stack has a char element on top and no partial UTF-8 sequence is pending.
     static const bool prefilter_env = [] {
         const char * env = getenv("LLAMA_GRAMMAR_PREFILTER");
@@ -1444,17 +1518,25 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
     std::fill(ascii_ok, ascii_ok + 128, (int8_t) -1);
     const std::vector<uint32_t> * first_cps = prefilter ? &llama_grammar_first_cps(grammar) : nullptr;
 
-    std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
-    candidates_decoded.reserve(prefilter ? 256 : cur_p->size);
+    // per ASCII first code point: the stacks after it (state 1: all with a char element on top, 0: not usable)
+    struct level2 {
+        int8_t               state = -1;
+        llama_grammar_stacks stacks;
+        int8_t               ascii[128];
+    };
+    std::vector<level2> l2;
+
+    // code points of all candidates in one buffer (offsets while decoding, pointers after)
+    std::vector<uint32_t> cps_all;
+    std::vector<size_t>   cps_off;
 
     llama_grammar_candidates candidates_grammar;
-    candidates_grammar.reserve(prefilter ? 256 : cur_p->size);
 
     for (size_t i = 0; i < cur_p->size; ++i) {
         const llama_token id = cur_p->data[i].id;
 
         if (prefilter) {
-            const uint32_t cp = (*first_cps)[id];
+            const uint32_t cp = (*first_cps)[2*id];
             if (cp == LLAMA_GRAMMAR_CP_EOG) {
                 if (!allow_eog) {
                     cur_p->data[i].logit = -INFINITY;
@@ -1479,6 +1561,61 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
                     cur_p->data[i].logit = -INFINITY;
                     continue;
                 }
+                // second code point against the stacks after the first one (ASCII first code points)
+                const uint32_t cp2 = (*first_cps)[2*id + 1];
+                if (cp < 128 && cp2 != LLAMA_GRAMMAR_CP_FULL) {
+                    if (l2.empty()) {
+                        l2.resize(128);
+                    }
+                    auto & e = l2[cp];
+                    if (e.state < 0) {
+                        for (const auto & stack : grammar.stacks) {
+                            if (stack.empty() || !llama_grammar_match_char(stack.back(), cp).first) {
+                                continue;
+                            }
+                            // as llama_grammar_reject_candidates_for_stack: the element after the char range
+                            const auto * pos_after = llama_grammar_match_char(stack.back(), 0).second;
+                            llama_grammar_stack stack_after(stack.begin(), stack.end() - 1);
+                            if (!llama_grammar_is_end_of_sequence(pos_after)) {
+                                stack_after.push_back(pos_after);
+                            }
+                            llama_grammar_advance_stack(grammar.rules, stack_after, e.stacks);
+                        }
+                        e.state = 1;
+                        for (const auto & stack : e.stacks) {
+                            if (!stack.empty()) {
+                                const auto type = stack.back()->type;
+                                if (type != LLAMA_GRETYPE_CHAR && type != LLAMA_GRETYPE_CHAR_NOT && type != LLAMA_GRETYPE_CHAR_ANY) {
+                                    e.state = 0;
+                                }
+                            }
+                        }
+                        std::fill(e.ascii, e.ascii + 128, (int8_t) -1);
+                    }
+                    if (e.state == 1) {
+                        auto matches2 = [&](const uint32_t chr) {
+                            for (const auto & stack : e.stacks) {
+                                if (!stack.empty() && llama_grammar_match_char(stack.back(), chr).first) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        };
+                        bool ok2;
+                        if (cp2 < 128) {
+                            if (e.ascii[cp2] < 0) {
+                                e.ascii[cp2] = matches2(cp2) ? 1 : 0;
+                            }
+                            ok2 = e.ascii[cp2] != 0;
+                        } else {
+                            ok2 = matches2(cp2);
+                        }
+                        if (!ok2) {
+                            cur_p->data[i].logit = -INFINITY;
+                            continue;
+                        }
+                    }
+                }
             }
         }
 
@@ -1491,9 +1628,13 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
         } else if (piece.empty() || piece[0] == 0) {
             cur_p->data[i].logit = -INFINITY;
         } else {
-            candidates_decoded.push_back(decode_utf8(piece, grammar.partial_utf8));
-            candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second, id });
+            cps_off.push_back(cps_all.size());
+            const llama_partial_utf8 partial = decode_utf8_append(piece, grammar.partial_utf8, cps_all);
+            candidates_grammar.push_back({ i, nullptr, partial, id });
         }
+    }
+    for (size_t j = 0; j < candidates_grammar.size(); ++j) {
+        candidates_grammar[j].code_points = cps_all.data() + cps_off[j];
     }
 
     const auto rejects = llama_grammar_reject_candidates(grammar.rules, grammar.stacks, candidates_grammar);
