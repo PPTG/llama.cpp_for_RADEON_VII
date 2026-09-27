@@ -2746,6 +2746,90 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     return cur;
 }
 
+// backend of the scheduler that runs on the device of buffer buf
+static ggml_backend_t llama_graph_backend_of_buffer(ggml_backend_sched_t sched, ggml_backend_buffer_t buf) {
+    if (buf == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_get_device(backend) == dev) {
+            return backend;
+        }
+    }
+    return nullptr;
+}
+
+ggml_tensor * llm_graph_context::build_attn_split_heads(
+        const llama_kv_cache_context * mctx_cur,
+        ggml_tensor * q,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * k_idxs,
+        ggml_tensor * v_idxs,
+        ggml_tensor * kq_b,
+        ggml_tensor * kq_mask,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+              float   kq_scale,
+                int   il) const {
+    GGML_ASSERT(kq_b == nullptr && sinks == nullptr && v_mla == nullptr && "LLAMA_KV_SPLIT_HEADS: not supported for this model");
+    GGML_ASSERT(cparams.flash_attn && "LLAMA_KV_SPLIT_HEADS needs flash attention");
+
+    ggml_backend_t backend_1 = llama_graph_backend_of_buffer(sched, mctx_cur->get_k2_storage(il)->buffer);
+
+    // store
+    for (int part = 0; part < 2; ++part) {
+        if (k_cur) {
+            ggml_tensor * t = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il, part);
+            if (part == 1 && backend_1) {
+                ggml_backend_sched_set_tensor_backend(sched, t, backend_1);
+            }
+            ggml_build_forward_expand(gf, t);
+        }
+        if (v_cur) {
+            ggml_tensor * t = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il, part);
+            if (part == 1 && backend_1) {
+                ggml_backend_sched_set_tensor_backend(sched, t, backend_1);
+            }
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+
+    // attention per part, the Q heads of the first KV heads go with the first part
+    ggml_tensor * k0 = mctx_cur->get_k(ctx0, il, 0);
+    ggml_tensor * k1 = mctx_cur->get_k(ctx0, il, 1);
+    ggml_tensor * v0 = mctx_cur->get_v(ctx0, il, 0);
+    ggml_tensor * v1 = mctx_cur->get_v(ctx0, il, 1);
+
+    const int64_t n_head_kv = k0->ne[1] + k1->ne[1];
+    GGML_ASSERT(q->ne[1] % n_head_kv == 0);
+    const int64_t n_q0 = k0->ne[1] * (q->ne[1] / n_head_kv);
+
+    ggml_tensor * q0 = ggml_view_3d(ctx0, q, q->ne[0], n_q0,            q->ne[2], q->nb[1], q->nb[2], 0);
+    ggml_tensor * q1 = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1] - n_q0, q->ne[2], q->nb[1], q->nb[2], n_q0*q->nb[1]);
+
+    ggml_tensor * cur0 = build_attn_mha(q0, k0, v0, nullptr, kq_mask, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * cur1 = build_attn_mha(q1, k1, v1, nullptr, kq_mask, nullptr, nullptr, 0, kq_scale, il);
+
+    if (backend_1) {
+        // the attention of the second part runs on the device of its KV cache
+        ggml_tensor * fa = cur1;
+        while (fa && fa->op != GGML_OP_FLASH_ATTN_EXT) {
+            fa = fa->view_src ? fa->view_src : fa->src[0];
+        }
+        GGML_ASSERT(fa != nullptr);
+        ggml_backend_sched_set_tensor_backend(sched, fa, backend_1);
+    }
+
+    // [n_embd_head_v*n_head_q, n_tokens]
+    ggml_tensor * cur = ggml_concat(ctx0, cur0, cur1, 0);
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
 
@@ -2895,17 +2979,26 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        if (mctx_cur->get_n_head_split(il) == 0) {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        }
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur;
+    if (mctx_cur->get_n_head_split(il) > 0) {
+        cur = build_attn_split_heads(mctx_cur, q, k_cur, v_cur, inp->get_k_idxs(), inp->get_v_idxs(),
+                kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    } else {
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -2982,6 +3075,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
 
     const auto * mctx_cur = inp->mctx;
+
+    GGML_ASSERT(mctx_cur->get_n_head_split(il) == 0 && "LLAMA_KV_SPLIT_HEADS: not supported for K-only caches");
 
     // store to KV cache
     {
@@ -3141,14 +3236,16 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
+    const bool split_heads = mctx_cur->get_n_head_split(il) > 0;
+
     // optionally store to KV cache
-    if (k_cur) {
+    if (k_cur && !split_heads) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
 
-    if (v_cur) {
+    if (v_cur && !split_heads) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
@@ -3157,10 +3254,18 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur;
+    if (split_heads) {
+        cur = build_attn_split_heads(mctx_cur, q, k_cur, v_cur,
+                is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs(), is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs(),
+                kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    } else {
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -3216,6 +3321,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_iswa = inp->mctx;
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+
+    GGML_ASSERT(mctx_cur->get_n_head_split(il) == 0 && "LLAMA_KV_SPLIT_HEADS: not supported for K-only caches");
 
     // optionally store to KV cache
     if (k_cur) {

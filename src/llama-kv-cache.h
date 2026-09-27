@@ -189,12 +189,20 @@ public:
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    // part: for a layer with the KV heads split over two devices (LLAMA_KV_SPLIT_HEADS), 0 = first heads, 1 = the rest
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, int part = 0) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, int part = 0) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    // (for a split layer k_cur/v_cur hold all heads, only the heads of the part are stored)
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo, int part = 0) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo, int part = 0) const;
+
+    // number of KV heads in the first part if the heads of layer il are split over two devices, else 0
+    uint32_t get_n_head_split(int32_t il) const;
+
+    // the K cache tensor of the second part (on the other device) of a split layer
+    ggml_tensor * get_k2_storage(int32_t il) const;
 
     //
     // preparation API
@@ -260,6 +268,11 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // LLAMA_KV_SPLIT_HEADS: the KV heads [n_head_split, n_head_kv) are in k2/v2 on another device
+        ggml_tensor * k2 = nullptr;
+        ggml_tensor * v2 = nullptr;
+        uint32_t n_head_split = 0;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -400,8 +413,11 @@ public:
     ggml_type type_v() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, int part = 0) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, int part = 0) const;
+
+    uint32_t      get_n_head_split(int32_t il) const;
+    ggml_tensor * get_k2_storage  (int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -409,8 +425,8 @@ public:
     //   - k_idxs [n_tokens]
     //   - v_cur  [n_embd_head_v, n_head_v, n_tokens]
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, int part = 0) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, int part = 0) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

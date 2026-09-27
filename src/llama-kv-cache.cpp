@@ -230,23 +230,65 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        // LLAMA_KV_SPLIT_HEADS=1: put half of the KV heads of the non-SWA layers on another GPU, their attention runs
+        // there in parallel (see llm_graph_context::build_attn). Needs flash attention (V not transposed), one stream.
+        static const bool split_heads_env = [] {
+            const char * env = getenv("LLAMA_KV_SPLIT_HEADS");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        ggml_backend_dev_t dev_other = nullptr;
+        uint32_t n_head_split = 0;
+        if (split_heads_env && offload && !v_trans && n_stream == 1 && has_v && !hparams.is_swa(il)) {
+            const uint32_t n_head_kv = hparams.n_head_kv(il);
+            if (n_head_kv >= 2 && n_head_kv % 2 == 0 &&
+                    n_embd_k_gqa == hparams.n_embd_head_k(il)*n_head_kv && n_embd_v_gqa == hparams.n_embd_head_v(il)*n_head_kv) {
+                for (const auto & d : model.devices) {
+                    if (!d.is_meta && d.dev != model.dev_layer(il) && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        dev_other = d.dev;
+                        break;
+                    }
+                }
+                if (dev_other) {
+                    n_head_split = n_head_kv/2;
+                }
+            }
+        }
+
+        const uint32_t n_embd_k_0 = n_head_split ? hparams.n_embd_head_k(il)*n_head_split : n_embd_k_gqa;
+        const uint32_t n_embd_v_0 = n_head_split ? hparams.n_embd_head_v(il)*n_head_split : n_embd_v_gqa;
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_0, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_0, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
+
+        ggml_tensor * k2 = nullptr;
+        ggml_tensor * v2 = nullptr;
+        if (n_head_split) {
+            ggml_context * ctx2 = ctx_for_buft(ggml_backend_dev_buffer_type(dev_other));
+            if (!ctx2) {
+                throw std::runtime_error("failed to create ggml context for kv cache");
+            }
+            k2 = ggml_new_tensor_3d(ctx2, type_k, n_embd_k_gqa - n_embd_k_0, kv_size, n_stream);
+            v2 = ggml_new_tensor_3d(ctx2, type_v, n_embd_v_gqa - n_embd_v_0, kv_size, n_stream);
+            ggml_format_name(k2, "cache_%sk_l%d_part1", name_tag, il);
+            ggml_format_name(v2, "cache_%sv_l%d_part1", name_tag, il);
+            LLAMA_LOG_INFO("%s: layer %3d: KV heads %u..%u on %s\n", __func__, il, n_head_split, hparams.n_head_kv(il) - 1,
+                    ggml_backend_dev_name(dev_other));
+        }
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_0, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_0, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, k2, v2, n_head_split });
     }
 
     if (reuse) {
@@ -1263,43 +1305,61 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_n_head_split(int32_t il) const {
+    return layers[map_layer_ids.at(il)].n_head_split;
+}
+
+ggml_tensor * llama_kv_cache::get_k2_storage(int32_t il) const {
+    return layers[map_layer_ids.at(il)].k2;
+}
+
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, int part) const {
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * k = layers[ikv].k;
+    const auto & layer = layers[ikv];
+    GGML_ASSERT(part == 0 || layer.k2);
+
+    auto * k = part ? layer.k2 : layer.k;
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
-    assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+    assert(layer.n_head_split || n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    const int64_t n_head = layer.n_head_split ? n_embd_k_gqa / hparams.n_embd_head_k(il) : hparams.n_head_kv(il);
+
     return ggml_view_4d(ctx, k,
-            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
+            hparams.n_embd_head_k(il), n_head, n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, int part) const {
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * v = layers[ikv].v;
+    const auto & layer = layers[ikv];
+    GGML_ASSERT(part == 0 || layer.v2);
+
+    auto * v = part ? layer.v2 : layer.v;
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
 
     // [TAG_V_CACHE_VARIABLE]
-    assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
+    assert(layer.n_head_split || n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     if (!v_trans) {
+        const int64_t n_head = layer.n_head_split ? n_embd_v_gqa / hparams.n_embd_head_v(il) : hparams.n_head_kv(il);
+
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
-                hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
+                hparams.n_embd_head_v(il), n_head, n_kv, ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
@@ -1315,12 +1375,26 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+// the heads of k_cur/v_cur [n_embd_head, n_head, n_tokens] that belong to part of a split layer
+static ggml_tensor * llama_kv_cache_heads_of_part(ggml_context * ctx, ggml_tensor * cur, uint32_t n_head_split, int part) {
+    if (n_head_split == 0) {
+        return cur;
+    }
+    const int64_t h0 = part ? n_head_split : 0;
+    const int64_t nh = part ? cur->ne[1] - n_head_split : n_head_split;
+    return ggml_view_3d(ctx, cur, cur->ne[0], nh, cur->ne[2], cur->nb[1], cur->nb[2], h0*cur->nb[1]);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo, int part) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
 
-    ggml_tensor * k = layers[ikv].k;
+    GGML_ASSERT(part == 0 || layers[ikv].k2);
+
+    ggml_tensor * k = part ? layers[ikv].k2 : layers[ikv].k;
+
+    k_cur = llama_kv_cache_heads_of_part(ctx, k_cur, layers[ikv].n_head_split, part);
 
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
@@ -1350,12 +1424,16 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 
-ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo, int part) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * v = layers[ikv].v;
+    GGML_ASSERT(part == 0 || layers[ikv].v2);
+
+    auto * v = part ? layers[ikv].v2 : layers[ikv].v;
+
+    v_cur = llama_kv_cache_heads_of_part(ctx, v_cur, layers[ikv].n_head_split, part);
 
     const int64_t n_embd_head = v_cur->ne[0];
     const int64_t n_head      = v_cur->ne[1];
@@ -1905,7 +1983,7 @@ size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_k_bytes += ggml_nbytes(layer.k);
+        size_k_bytes += ggml_nbytes(layer.k) + (layer.k2 ? ggml_nbytes(layer.k2) : 0);
     }
 
     return size_k_bytes;
@@ -1915,7 +1993,7 @@ size_t llama_kv_cache::size_v_bytes() const {
     size_t size_v_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_v_bytes += layer.v ? ggml_nbytes(layer.v) : 0;
+        size_v_bytes += (layer.v ? ggml_nbytes(layer.v) : 0) + (layer.v2 ? ggml_nbytes(layer.v2) : 0);
     }
 
     return size_v_bytes;
@@ -2035,16 +2113,20 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
-        ggml_tensor * k =
-            ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
-                ggml_row_size(layer.k->type, n_embd_head_k),
-                ggml_row_size(layer.k->type, n_embd_k_gqa),
-                ggml_row_size(layer.k->type, n_embd_nope));
+        for (int part = 0; part < (layer.k2 ? 2 : 1); ++part) {
+            ggml_tensor * kp = part ? layer.k2 : layer.k;
 
-        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
+            ggml_tensor * k =
+                ggml_view_3d(ctx, kp,
+                    n_rot, layer.n_head_split ? kp->ne[0]/n_embd_head_k : n_head_kv, get_size()*n_stream,
+                    ggml_row_size(kp->type, n_embd_head_k),
+                    ggml_row_size(kp->type, layer.n_head_split ? kp->ne[0] : n_embd_k_gqa),
+                    ggml_row_size(kp->type, n_embd_nope));
 
-        ggml_build_forward_expand(gf, cur);
+            ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
+
+            ggml_build_forward_expand(gf, cur);
+        }
     }
 
     res->add_input(std::move(inp));
@@ -2056,6 +2138,12 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
+    }
+
+    for (const auto & layer : layers) {
+        if (layer.k2) {
+            throw std::runtime_error("saving the KV cache state is not supported with LLAMA_KV_SPLIT_HEADS");
+        }
     }
 
     GGML_UNUSED(flags);
@@ -2123,6 +2211,11 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    for (const auto & layer : layers) {
+        if (layer.k2) {
+            throw std::runtime_error("loading the KV cache state is not supported with LLAMA_KV_SPLIT_HEADS");
+        }
+    }
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
 }
 
@@ -2859,20 +2952,28 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
-ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, int part) const {
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], part);
 }
 
-ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, int part) const {
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], part);
 }
 
-ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
-    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+uint32_t llama_kv_cache_context::get_n_head_split(int32_t il) const {
+    return kv->get_n_head_split(il);
 }
 
-ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
-    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_k2_storage(int32_t il) const {
+    return kv->get_k2_storage(il);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, int part) const {
+    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur], part);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, int part) const {
+    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur], part);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

@@ -1194,6 +1194,22 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // LLAMA_KV_SPLIT_HEADS: the KV heads of layer il are split over two devices, store k_cur/v_cur in both parts and
+    // run the attention of each part on its device (the Q heads of a KV head go with it), returns the joined result
+    ggml_tensor * build_attn_split_heads(
+            const llama_kv_cache_context * mctx_cur,
+            ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur,   // [n_embd_head_k, n_head_k, n_tokens], nullptr if the layer does not store
+            ggml_tensor * v_cur,   // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * k_idxs,
+            ggml_tensor * v_idxs,
+            ggml_tensor * kq_b,
+            ggml_tensor * kq_mask,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const;
+
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(
