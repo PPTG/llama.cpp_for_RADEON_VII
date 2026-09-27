@@ -773,8 +773,30 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// GGML_CUDA_FA_LOG=1: print the shapes, strides and the kernel of each FLASH_ATTN_EXT call (first 200 calls)
+static void ggml_cuda_flash_attn_ext_log(const ggml_tensor * dst, const int kernel) {
+    static const bool enabled = getenv("GGML_CUDA_FA_LOG") != nullptr && atoi(getenv("GGML_CUDA_FA_LOG")) != 0;
+    static int n_logged = 0;
+    if (!enabled || n_logged >= 200) {
+        return;
+    }
+    n_logged++;
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    GGML_LOG_INFO("FA %s: kernel %d, Q %s [%lld,%lld,%lld,%lld], K %s [%lld,%lld,%lld,%lld] nb [%zu,%zu,%zu], "
+        "V %s nb [%zu,%zu,%zu], mask [%lld,%lld,%lld,%lld]\n",
+        dst->name, kernel, ggml_type_name(Q->type), (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+        ggml_type_name(K->type), (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
+        K->nb[1], K->nb[2], K->nb[3], ggml_type_name(V->type), V->nb[1], V->nb[2], V->nb[3],
+        mask ? (long long) mask->ne[0] : 0LL, mask ? (long long) mask->ne[1] : 0LL, mask ? (long long) mask->ne[2] : 0LL,
+        mask ? (long long) mask->ne[3] : 0LL);
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    ggml_cuda_flash_attn_ext_log(dst, ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst));
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
