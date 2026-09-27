@@ -3788,6 +3788,10 @@ struct test_mul_mat_multi : public test_case {
 
     test_mul_mat_multi(ggml_type type, int64_t k, std::array<int64_t, 3> m) : type(type), k(k), m(m) {}
 
+    double max_nmse_err() override {
+        return 5e-4; // same as test_mul_mat, src1 is quantized to q8_1
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
         ggml_tensor * x2 = ggml_scale(ctx, x, 0.5f); // compute node as src1
