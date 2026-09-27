@@ -1,5 +1,6 @@
 #include "unary.cuh"
 #include "convert.cuh"
+#include "quantize.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -718,4 +719,107 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
     } else {
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
+}
+
+// glu -> quantize_q8_1 in one kernel, for a glu that only feeds a MMVQ mul_mat. The glu value and the quantization
+// are computed exactly as unary_gated_op_kernel and quantize_q8_1 do, so the result is the same.
+template <float (*op)(float)>
+static __global__ void glu_quantize_q8_1_kernel(
+        const float * __restrict__ x, const float * __restrict__ g, void * __restrict__ vy,
+        const int64_t nc, const int64_t o0, const int64_t o1, const int64_t ne0_padded) {
+    const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i0 >= ne0_padded) {
+        return;
+    }
+    const int64_t row    = blockIdx.y;
+    const int64_t i_cont = row*ne0_padded + i0;
+
+    block_q8_1 * y = (block_q8_1 *) vy;
+
+    const int64_t ib  = i_cont / QK8_1;
+    const int64_t iqs = i_cont % QK8_1;
+
+    const float xi = i0 < nc ? (float) (op(x[row*o0 + i0]) * g[row*o1 + i0]) : 0.0f;
+    float amax = fabsf(xi);
+    float sum  = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    y[ib].qs[iqs] = q;
+
+    if (iqs > 0) {
+        return;
+    }
+
+    y[ib].ds = make_half2(d, sum);
+}
+
+bool ggml_cuda_glu_quantize_q8_1_supported(const ggml_tensor * glu) {
+    if (glu->op != GGML_OP_GLU || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || ggml_nrows(glu) > 65535) {
+        return false;
+    }
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_GEGLU:
+        case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU_ERF:
+        case GGML_GLU_OP_GEGLU_QUICK:
+            break;
+        default:
+            return false;
+    }
+    const ggml_tensor * src0 = glu->src[0];
+    const ggml_tensor * src1 = glu->src[1];
+    if (src0->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(src0) || src0->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (src1 && (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(src1) || src1->nb[0] != sizeof(float))) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_glu_quantize_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, void * q8, const int64_t ne0_padded) {
+    GGML_ASSERT(ggml_cuda_glu_quantize_q8_1_supported(glu));
+
+    const ggml_tensor * src0 = glu->src[0];
+    const ggml_tensor * src1 = glu->src[1];
+    const int64_t nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    GGML_ASSERT(glu->ne[0] == nc);
+    GGML_ASSERT(ne0_padded % QK8_1 == 0 && ne0_padded >= nc);
+
+    const float * x = (const float *) src0->data;
+    const float * g = src1 ? (const float *) src1->data : (const float *) src0->data;
+    const int64_t o0 = src0->nb[1] / sizeof(float);
+    const int64_t o1 = src1 ? src1->nb[1] / sizeof(float) : o0;
+    if (!src1) {
+        const int32_t swapped = ((const int32_t *) glu->op_params)[1];
+        x += swapped ? nc : 0;
+        g += swapped ? 0 : nc;
+    }
+
+    const dim3 blocks((ne0_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE, ggml_nrows(glu), 1);
+    const dim3 threads(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    cudaStream_t stream = ctx.stream();
+
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_GEGLU:
+            glu_quantize_q8_1_kernel<op_gelu><<<blocks, threads, 0, stream>>>(x, g, q8, nc, o0, o1, ne0_padded);
+            break;
+        case GGML_GLU_OP_SWIGLU:
+            glu_quantize_q8_1_kernel<op_silu><<<blocks, threads, 0, stream>>>(x, g, q8, nc, o0, o1, ne0_padded);
+            break;
+        case GGML_GLU_OP_GEGLU_ERF:
+            glu_quantize_q8_1_kernel<op_gelu_erf><<<blocks, threads, 0, stream>>>(x, g, q8, nc, o0, o1, ne0_padded);
+            break;
+        case GGML_GLU_OP_GEGLU_QUICK:
+            glu_quantize_q8_1_kernel<op_gelu_quick><<<blocks, threads, 0, stream>>>(x, g, q8, nc, o0, o1, ne0_padded);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
 }

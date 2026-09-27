@@ -19,10 +19,10 @@ bench() {
 CONFIGS=(
     "all on (default)|"
     "no QKV multi MMVQ|GGML_CUDA_FUSE_QKV=0"
+    "no glu+q8 fusion|GGML_CUDA_FUSE_GLU_Q8=0"
+    "no multi norm|GGML_CUDA_FUSE_NORM_MULTI=0"
     "no fusions at all|GGML_CUDA_DISABLE_FUSION=1"
-    "no Q8 cache|GGML_CUDA_MMVQ_Q8_CACHE=0"
     "upstream MMVQ|GGML_HIP_MMVQ_VARIANT=0"
-    "MMVQ variant 3|GGML_HIP_MMVQ_VARIANT=3"
 )
 
 printf "%-22s %8s %8s\n" "config" "1 GPU" "2 GPU"

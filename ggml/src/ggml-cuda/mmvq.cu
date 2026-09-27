@@ -1610,7 +1610,7 @@ static char * ggml_cuda_mmvq_quantize_src1(
 
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const void * src1_q8_1_pre) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -1689,7 +1689,8 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
-    char * src1_q8_1_ptr = ggml_cuda_mmvq_quantize_src1(ctx, src1, src0->type, ids == nullptr, src1_q8_1_pool);
+    const char * src1_q8_1_ptr = src1_q8_1_pre ? (const char *) src1_q8_1_pre :
+        ggml_cuda_mmvq_quantize_src1(ctx, src1, src0->type, ids == nullptr, src1_q8_1_pool);
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;

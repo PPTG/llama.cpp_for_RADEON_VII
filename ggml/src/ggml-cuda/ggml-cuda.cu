@@ -3401,13 +3401,28 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
-    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+    if ((ops.size() == 2 || ops.size() == 3 || ops.size() == 4) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
         const ggml_tensor *add      = nullptr;
 
-        if (ops.size() == 3 && ops.begin()[2] == GGML_OP_ADD) {
+        if (ops.size() >= 3 && ops.begin()[2] == GGML_OP_ADD) {
             add = cgraph->nodes[node_idx+2];
+        } else if (ops.size() >= 3) {
+            return false;
+        }
+
+        // rms_norm -> mul -> add -> mul by a scalar tensor
+        if (ops.size() == 4) {
+            const ggml_tensor * post = cgraph->nodes[node_idx+3];
+            if (ops.begin()[3] != GGML_OP_MUL || post->type != GGML_TYPE_F32 || !ggml_are_same_shape(post, add)) {
+                return false;
+            }
+            const ggml_tensor * scalar = post->src[0] == add ? post->src[1] : (post->src[1] == add ? post->src[0] : nullptr);
+            if (scalar == nullptr || scalar->type != GGML_TYPE_F32 || ggml_nelements(scalar) != 1 || !ggml_is_contiguous(post) ||
+                    !ggml_is_contiguous(add)) {
+                return false;
+            }
         }
 
         GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
@@ -3618,6 +3633,83 @@ static bool ggml_cuda_fuse_qkv_enabled() {
 #endif // GGML_USE_HIP
     }();
     return enabled;
+}
+
+// GGML_CUDA_FUSE_GLU_Q8=0/1: glu that only feeds a MMVQ mul_mat writes q8_1 directly (glu + quantize in one kernel).
+// Default on for HIP.
+static bool ggml_cuda_fuse_glu_q8_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_GLU_Q8");
+        if (env != nullptr) {
+            return atoi(env) != 0;
+        }
+#ifdef GGML_USE_HIP
+        return true;
+#else
+        return false;
+#endif // GGML_USE_HIP
+    }();
+    return enabled;
+}
+
+// GGML_CUDA_FUSE_NORM_MULTI=0/1: several rms_norm -> [scale ->] mul chains on the same input (e.g. the 3 norms of
+// attn_out in Gemma 4) run as one kernel, graph_optimize moves them next to each other. Default on for HIP.
+static bool ggml_cuda_fuse_norm_multi_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_NORM_MULTI");
+        if (env != nullptr) {
+            return atoi(env) != 0;
+        }
+#ifdef GGML_USE_HIP
+        return true;
+#else
+        return false;
+#endif // GGML_USE_HIP
+    }();
+    return enabled;
+}
+
+// rms_norm -> [scale ->] mul by a 1D weight at node idx, returns the chain length (2 or 3) or 0.
+static int ggml_cuda_match_rms_norm_chain(const ggml_cgraph * cgraph, const int idx) {
+    if (idx + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * norm = cgraph->nodes[idx];
+    const ggml_tensor * x    = norm->src[0];
+    if (norm->op != GGML_OP_RMS_NORM || norm->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous_rows(x) || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[1] > 65535) {
+        return 0;
+    }
+    int len = 2;
+    const ggml_tensor * prev = norm;
+    if (cgraph->nodes[idx + 1]->op == GGML_OP_SCALE) {
+        const ggml_tensor * scale = cgraph->nodes[idx + 1];
+        float bias;
+        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+        if (scale->src[0] != norm || bias != 0.0f || scale->type != GGML_TYPE_F32 || idx + 2 >= cgraph->n_nodes) {
+            return 0;
+        }
+        prev = scale;
+        len  = 3;
+    }
+    const ggml_tensor * mul = cgraph->nodes[idx + len - 1];
+    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) || !ggml_are_same_shape(mul, norm)) {
+        return 0;
+    }
+    const ggml_tensor * w = mul->src[0] == prev ? mul->src[1] : (mul->src[1] == prev ? mul->src[0] : nullptr);
+    if (w == nullptr || w->op != GGML_OP_NONE || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
+            w->ne[0] != x->ne[0] || ggml_nelements(w) != x->ne[0]) {
+        return 0;
+    }
+    const ggml_op ops[3] = { GGML_OP_RMS_NORM, len == 3 ? GGML_OP_SCALE : GGML_OP_MUL, GGML_OP_MUL };
+    if (!ggml_can_fuse(cgraph, idx, ops, len)) {
+        return 0;
+    }
+    return len;
+}
+
+static bool ggml_cuda_rms_norm_same_input(const ggml_tensor * a, const ggml_tensor * b) {
+    return a->src[0] == b->src[0] && memcmp(a->op_params, b->op_params, sizeof(float)) == 0;
 }
 
 // mul_mat that can take part in a multi MMVQ launch: quantized weights, single token
@@ -4292,6 +4384,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // glu -> mul_mat(_id) (e.g. ffn_down): compute the glu and quantize it for MMVQ in one kernel
+    if (node->op == GGML_OP_GLU && ggml_cuda_fuse_glu_q8_enabled() && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        if ((mm->op == GGML_OP_MUL_MAT || mm->op == GGML_OP_MUL_MAT_ID) && mm->src[1] == node &&
+                ggml_is_quantized(mm->src[0]->type) && ggml_cuda_glu_quantize_q8_1_supported(node) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(mm) && ggml_can_fuse(cgraph, i, { GGML_OP_GLU, mm->op })) {
+            const int64_t ne0_padded = GGML_PAD(node->ne[0], MATRIX_ROW_PADDING);
+            ggml_cuda_pool_alloc<char> q8(cuda_ctx->pool(), ggml_nrows(node) * ne0_padded * sizeof(block_q8_1) / QK8_1);
+            ggml_cuda_glu_quantize_q8_1(*cuda_ctx, node, q8.get(), ne0_padded);
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], node, mm->src[2], mm, nullptr, q8.get());
+            return 1;
+        }
+    }
+
     // Q, K, V (or any consecutive mul_mat with the same src1) as one MMVQ launch
     if (ggml_cuda_fuse_qkv_enabled() && ggml_cuda_is_multi_mmvq_candidate(node)) {
         const ggml_tensor * src0s[3] = { node->src[0], nullptr, nullptr };
@@ -4464,6 +4570,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // several rms_norm -> [scale ->] mul chains on the same input in one kernel
+    if (node->op == GGML_OP_RMS_NORM && ggml_cuda_fuse_norm_multi_enabled()) {
+        const ggml_tensor * norms[3]  = {};
+        const ggml_tensor * scales[3] = {};
+        const ggml_tensor * muls[3]   = {};
+        int n = 0;
+        int pos = i;
+        while (n < 3) {
+            const int len = ggml_cuda_match_rms_norm_chain(cgraph, pos);
+            if (len == 0 || (n > 0 && !ggml_cuda_rms_norm_same_input(cgraph->nodes[pos], norms[0]))) {
+                break;
+            }
+            norms[n]  = cgraph->nodes[pos];
+            scales[n] = len == 3 ? cgraph->nodes[pos + 1] : nullptr;
+            muls[n]   = cgraph->nodes[pos + len - 1];
+            n++;
+            pos += len;
+        }
+        if (n >= 2) {
+            ggml_cuda_op_rms_norm_multi(*cuda_ctx, norms, scales, muls, n);
+            return pos - i - 1;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -4472,6 +4602,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+        return 3;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
@@ -4873,6 +5008,40 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     cgraph->nodes[group_end] = cand;
                 }
                 group_end++;
+            }
+            i = group_end - 1;
+        }
+    }
+
+    // Move rms_norm -> [scale ->] mul chains on the same input next to each other (see ggml_cuda_fuse_norm_multi_enabled).
+    // A chain only depends on its input and on weights, so it can run right after the first chain on that input.
+    if (!disable_fusion && ggml_cuda_fuse_norm_multi_enabled()) {
+        constexpr int max_lookahead = 64;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const int len0 = ggml_cuda_match_rms_norm_chain(cgraph, i);
+            if (len0 == 0) {
+                continue;
+            }
+            const ggml_tensor * first = cgraph->nodes[i];
+            int group_end = i + len0;
+            int n_chains  = 1;
+            for (int j = group_end; j < cgraph->n_nodes && j <= i + max_lookahead && n_chains < 3; ++j) {
+                if (cgraph->nodes[j]->op != GGML_OP_RMS_NORM || !ggml_cuda_rms_norm_same_input(cgraph->nodes[j], first)) {
+                    continue;
+                }
+                const int len = ggml_cuda_match_rms_norm_chain(cgraph, j);
+                if (len == 0) {
+                    continue;
+                }
+                if (j != group_end) {
+                    ggml_tensor * chain[3];
+                    memcpy(chain, &cgraph->nodes[j], len * sizeof(ggml_tensor *));
+                    memmove(&cgraph->nodes[group_end + len], &cgraph->nodes[group_end], (j - group_end) * sizeof(ggml_tensor *));
+                    memcpy(&cgraph->nodes[group_end], chain, len * sizeof(ggml_tensor *));
+                }
+                group_end += len;
+                n_chains++;
+                j = group_end - 1;
             }
             i = group_end - 1;
         }

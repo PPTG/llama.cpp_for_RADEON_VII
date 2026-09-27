@@ -121,3 +121,7 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+// glu followed by quantization to q8_1 (MMVQ src1 layout, rows padded to ne0_padded) in one kernel
+bool ggml_cuda_glu_quantize_q8_1_supported(const ggml_tensor * glu);
+void ggml_cuda_glu_quantize_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, void * q8, int64_t ne0_padded);

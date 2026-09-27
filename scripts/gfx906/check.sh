@@ -16,7 +16,7 @@ BIN=${BUILD_DIR}/bin
 
 if [ -z "${SKIP_TESTS:-}" ]; then
 echo "=== correctness vs CPU"
-for OP in MUL_MAT MUL_MAT_ID MUL_MAT_VEC_FUSION MUL_MAT_VEC_FUSION_MERGED MUL_MAT_MULTI RMS_NORM_SCALE_MUL RMS_NORM_MUL_ADD MOE_REDUCE; do
+for OP in MUL_MAT MUL_MAT_ID MUL_MAT_VEC_FUSION MUL_MAT_VEC_FUSION_MERGED MUL_MAT_MULTI GLU_MUL_MAT RMS_NORM_MULTI RMS_NORM_SCALE_MUL RMS_NORM_MUL_ADD MOE_REDUCE; do
     R=$("${BIN}/test-backend-ops" -b ROCm0 -o "${OP}" 2>&1 | tee "/tmp/check-${OP}.log" | grep -E "tests passed" | tail -n 1)
     echo "${OP}: ${R}"
     grep -m 5 "FAIL" "/tmp/check-${OP}.log"
@@ -31,15 +31,18 @@ gen() {
     env "$@" "${BIN}/llama-completion" -m "${MODEL}" -ngl 99 -fa on -sm none -no-cnv --temp 0 -n 64 -p "${PROMPT}" \
         --no-display-prompt 2>/dev/null
 }
-REF=$(gen GGML_CUDA_FUSE_QKV=0)
 OUT=$(gen)
-if [ -n "${OUT}" ] && [ "${OUT}" == "${REF}" ]; then
-    echo "OK   QKV multi MMVQ == separate"
-else
-    echo "DIFF QKV multi MMVQ != separate"
-    echo "--- separate: $(echo "${REF}" | head -c 300)"
-    echo "--- multi:    $(echo "${OUT}" | head -c 300)"
-fi
+# these fork fusions compute exactly the same values as the unfused ops, the text must not change
+for OFF in GGML_CUDA_FUSE_QKV=0 GGML_CUDA_FUSE_GLU_Q8=0 GGML_CUDA_FUSE_NORM_MULTI=0; do
+    REF=$(gen ${OFF})
+    if [ -n "${OUT}" ] && [ "${OUT}" == "${REF}" ]; then
+        echo "OK   default == ${OFF}"
+    else
+        echo "DIFF default != ${OFF}"
+        echo "--- ${OFF}: $(echo "${REF}" | head -c 300)"
+        echo "--- default: $(echo "${OUT}" | head -c 300)"
+    fi
+done
 NOFUSE=$(gen GGML_CUDA_DISABLE_FUSION=1)
 if [ "${OUT}" == "${NOFUSE}" ]; then
     echo "OK   all fusions == no fusions"

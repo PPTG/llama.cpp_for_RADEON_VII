@@ -8,8 +8,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
+// src1_q8_1: optional, src1 already quantized to q8_1 (rows padded to MATRIX_ROW_PADDING), src1 data is not read then
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
-    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
+    const void * src1_q8_1 = nullptr);
 
 // Several MMVQ (batch size 1) with the same src1 in one kernel launch, e.g. Q, K and V. HIP GCN only.
 bool ggml_cuda_mul_mat_vec_q_multi_supported(const ggml_tensor * const * src0s, const ggml_tensor * const * dsts, int n,
