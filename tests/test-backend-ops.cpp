@@ -11737,6 +11737,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, true,  1408, 1, 2816));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2816, 1, 704));
 
+    // token generation attention of Gemma 4 26B A4B: SWA layers (head 256, 8 KV heads, GQA 2, window 1024 + ubatch)
+    // and global layers (head 512, 2 KV heads, GQA 8) at long context
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 1536, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        for (int kv : { 4096, 16384, 65536, 131072 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

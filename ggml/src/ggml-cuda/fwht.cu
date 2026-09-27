@@ -90,6 +90,9 @@ __global__ void fwht_set_rows_q8_0_cuda(const T * src, char * dst, const idx_t *
     const int lane = threadIdx.x;
 
     ggml_cuda_pdl_sync();
+    // the row index is loaded first, its latency overlaps with the transform
+    const int     i_tok   = (int) r / rows_per_idx;
+    const int64_t dst_row = idx[i_tok * s_idx];
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
         reg[i] = ggml_cuda_cast<float>(src[i * warp_size + lane]) * scale;
@@ -97,8 +100,7 @@ __global__ void fwht_set_rows_q8_0_cuda(const T * src, char * dst, const idx_t *
 
     fwht_row<N>(reg, lane);
 
-    const int64_t dst_row = idx[(r / rows_per_idx) * s_idx];
-    block_q8_0 * y = (block_q8_0 *) (dst + dst_row * nb_dst1) + (r % rows_per_idx) * (N / QK8_0);
+    block_q8_0 * y = (block_q8_0 *) (dst + dst_row * nb_dst1) + ((int) r - i_tok*rows_per_idx) * (N / QK8_0);
 
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
@@ -282,6 +284,7 @@ static void ggml_cuda_op_fwht_set_rows_impl(ggml_backend_cuda_context & ctx, con
     char *        dst_d = (char *) set_rows->data;
 
     const int     rows_per_idx = set_rows->src[0]->ne[0] / n;
+    GGML_ASSERT(rows < INT32_MAX);
     const int64_t s_idx        = idx->nb[0] / sizeof(idx_t);
     const int64_t nb_dst1      = set_rows->nb[1];
 

@@ -972,6 +972,80 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// Same result as flash_attn_combine_results, but each block handles a chunk of 64 values of one head: more blocks for
+// few heads (token generation), and the scale of each part is computed once per block instead of once per thread.
+template<int D>
+__launch_bounds__(64, 1)
+static __global__ void flash_attn_combine_results_split(
+        const float  * VKQ_parts_ptr,
+        const float2 * VKQ_meta_ptr,
+        float * dst_ptr,
+        const int parallel_blocks) {
+    constexpr int nthreads = 64;
+    constexpr int nchunks  = D / nthreads;
+    static_assert(D % nthreads == 0, "bad D");
+
+    ggml_cuda_pdl_lc();
+    const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
+    const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
+    float        * GGML_CUDA_RESTRICT dst       = dst_ptr;
+
+    const int ne01 = gridDim.x / nchunks;
+    const int ne02 = gridDim.y;
+
+    const int col      = blockIdx.x / nchunks;
+    const int chunk    = blockIdx.x % nchunks;
+    const int head     = blockIdx.y;
+    const int sequence = blockIdx.z;
+
+    const int j_dst_unrolled = (sequence*ne01 + col)*ne02 + head;
+
+    VKQ_parts += j_dst_unrolled * parallel_blocks*D;
+    VKQ_meta  += j_dst_unrolled * parallel_blocks;
+    dst       += j_dst_unrolled *                 D;
+
+    const int tid = threadIdx.x;
+    const int i   = chunk*nthreads + tid;
+
+    extern __shared__ float2 meta[];
+    float * scale = (float *) (meta + parallel_blocks);
+    ggml_cuda_pdl_sync();
+    for (int l = tid; l < 2*parallel_blocks; l += nthreads) {
+        ((float *) meta)[l] = ((const float *)VKQ_meta) [l];
+    }
+
+    __syncthreads();
+
+    float kqmax = meta[0].x;
+    for (int l = 1; l < parallel_blocks; ++l) {
+        kqmax = max(kqmax, meta[l].x);
+    }
+
+    for (int l = tid; l < parallel_blocks; l += nthreads) {
+        scale[l] = expf(meta[l].x - kqmax);
+    }
+
+    __syncthreads();
+
+    float VKQ_numerator   = 0.0f;
+    float VKQ_denominator = 0.0f;
+#pragma unroll 4
+    for (int l = 0; l < parallel_blocks; ++l) {
+        VKQ_numerator   += scale[l] * VKQ_parts[l*D + i];
+        VKQ_denominator += scale[l] * meta[l].y;
+    }
+
+    dst[i] = VKQ_numerator / VKQ_denominator;
+}
+
+static bool ggml_cuda_fattn_combine_split_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_COMBINE_SPLIT");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1288,6 +1362,16 @@ void launch_fattn(
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
+        }
+    } else if (parallel_blocks > 1 && DV % 64 == 0 && ggml_cuda_fattn_combine_split_enabled()) {
+        if constexpr (DV % 64 == 0) {
+            const dim3 block_dim_combine(64, 1, 1);
+            const dim3 blocks_num_combine(Q->ne[1]*(DV/64), Q->ne[2], Q->ne[3]);
+            const size_t nbytes_shared_combine = parallel_blocks*(sizeof(float2) + sizeof(float));
+
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_combine_results_split<DV>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
         }
     } else if (parallel_blocks > 1) {
         const dim3 block_dim_combine(DV, 1, 1);
