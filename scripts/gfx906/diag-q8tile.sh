@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Narrow down the wrong text with a q8_0 KV cache when the Gemma 4 SWA layers (head 256) use the FA tile kernel
-# (GGML_CUDA_FA_Q8_VEC=0). Each line switches off one suspect. Greedy, 48 tokens, 1 GPU.
+# Text with a q8_0 KV cache for the FA kernel variants of the Gemma 4 SWA layers (head 256) and with single features
+# switched off. Greedy, 48 tokens, 1 GPU. Different kernels round differently, so only "tile" and
+# "tile, f16 conversion" must match exactly.
 #
 # usage: scripts/gfx906/diag-q8tile.sh [model.gguf] [build-dir]
 set -uo pipefail
@@ -17,7 +18,7 @@ gen() {
     echo
 }
 
-printf '%-44s ' "vector kernel (default)";                      gen
+printf '%-44s ' "vector kernel";                                gen GGML_CUDA_FA_Q8_VEC=1
 printf '%-44s ' "tile";                                         gen GGML_CUDA_FA_Q8_VEC=0
 printf '%-44s ' "tile, f16 conversion";                         gen GGML_CUDA_FA_Q8_VEC=0 GGML_CUDA_FA_TILE_Q8=0
 printf '%-44s ' "tile, no fusions";                             gen GGML_CUDA_FA_Q8_VEC=0 GGML_CUDA_DISABLE_FUSION=1

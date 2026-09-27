@@ -1276,12 +1276,28 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         const bool strides_ok = K->nb[1] % sizeof(half2) == 0 && V->nb[1] % sizeof(half2) == 0;
         if (ggml_cuda_fattn_tile_q8_enabled() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
                 Q->ne[1]*ncols2 <= 8 && strides_ok) {
-            constexpr int cols_per_block = 8;
-            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
-            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, GGML_TYPE_Q8_0>;
-            launch_fattn<DV, cols_per_block/ncols2, ncols2>
-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, false, false, false, false, warp_size);
+            // same number of columns per block as the f16 path below, so the results are the same
+            auto launch_q8 = [&](auto cols_per_block_c) {
+                constexpr int cols_per_block = decltype(cols_per_block_c)::value;
+                const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+                const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+                fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, GGML_TYPE_Q8_0>;
+                launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                    (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, false, false, false, false, warp_size);
+            };
+            if constexpr (ncols2 <= 2) {
+                if (Q->ne[1] <= 2/ncols2) {
+                    launch_q8(std::integral_constant<int, 2>{});
+                    return;
+                }
+            }
+            if constexpr (ncols2 <= 4) {
+                if (Q->ne[1] <= 4/ncols2) {
+                    launch_q8(std::integral_constant<int, 4>{});
+                    return;
+                }
+            }
+            launch_q8(std::integral_constant<int, 8>{});
             return;
         }
     }

@@ -58,13 +58,6 @@ else
     echo "--- q8_0:       $(echo "${Q8NEW}" | head -c 300)"
 fi
 
-# experimental q8_0 head 256 on the tile kernel: q8_0 read directly vs f16 conversion vs vector kernel (default)
-Q8T=$(genq8 GGML_CUDA_FA_Q8_VEC=0)
-Q8TC=$(genq8 GGML_CUDA_FA_Q8_VEC=0 GGML_CUDA_FA_TILE_Q8=0)
-echo "INFO q8_0 KV, head 256 on tile (GGML_CUDA_FA_Q8_VEC=0), first 150 chars:"
-echo "--- vector (default):  $(echo "${Q8NEW}" | head -c 150)"
-echo "--- tile, q8_0:        $(echo "${Q8T}" | head -c 150)"
-echo "--- tile, f16 conv.:   $(echo "${Q8TC}" | head -c 150)"
 # q8_0 KV cache: the Hadamard rotation fused into the cache store / attn_output quantization must not change the text
 Q8FWHT=$(genq8 GGML_CUDA_FUSE_FWHT=0)
 if [ -n "${Q8NEW}" ] && [ "${Q8NEW}" == "${Q8FWHT}" ]; then
