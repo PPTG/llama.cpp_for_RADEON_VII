@@ -16,7 +16,7 @@ BIN=${BUILD_DIR}/bin
 
 if [ -z "${SKIP_TESTS:-}" ]; then
 echo "=== correctness vs CPU"
-for OP in MUL_MAT MUL_MAT_ID MUL_MAT_VEC_FUSION MUL_MAT_VEC_FUSION_MERGED MUL_MAT_MULTI GLU_MUL_MAT RMS_NORM_MULTI RMS_NORM_SCALE_MUL RMS_NORM_MUL_ADD MOE_REDUCE; do
+for OP in MUL_MAT MUL_MAT_ID MUL_MAT_VEC_FUSION MUL_MAT_VEC_FUSION_MERGED MUL_MAT_MULTI GLU_MUL_MAT RMS_NORM_MULTI RMS_NORM_SCALE_MUL RMS_NORM_MUL_ADD MOE_REDUCE FLASH_ATTN_EXT; do
     R=$("${BIN}/test-backend-ops" -b ROCm0 -o "${OP}" 2>&1 | tee "/tmp/check-${OP}.log" | grep -E "tests passed" | tail -n 1)
     echo "${OP}: ${R}"
     grep -m 5 "FAIL" "/tmp/check-${OP}.log"
