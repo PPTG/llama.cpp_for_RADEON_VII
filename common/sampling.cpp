@@ -135,6 +135,12 @@ struct common_sampler {
     int32_t fast_i_top_k = -1;   // index of top-k in the chain
     float   fast_thr     = 0.0f; // smallest logit of the n largest (set by set_logits_top)
 
+    // time breakdown (us) and counts, printed by common_perf_print with LLAMA_SAMPLING_STATS=1
+    struct {
+        int64_t t_first = 0, t_check = 0, t_res_fast = 0, t_res_full = 0, t_accept = 0;
+        int32_t n_first = 0, n_first_fast = 0, n_res_fast = 0, n_res_fast_fail = 0, n_res_full = 0;
+    } stats;
+
     // candidates: the n = fast_top_k + fast_margin + n_more largest logits (a min-heap, most logits are rejected by one
     // compare) in cur[0, n), then fast_extra
     bool set_logits_top(struct llama_context * ctx, int idx, int n_more = 0) {
@@ -517,6 +523,7 @@ struct common_sampler * common_sampler_init(
         /* .fast_extra  = */ {},
         /* .fast_i_top_k = */ -1,
         /* .fast_thr     = */ 0.0f,
+        /* .stats        = */ {},
     };
 
     // fast path for the CPU sampling: only if every sampler in front of top-k lowers logits of at most a known number
@@ -632,11 +639,15 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
         }
     }
 
+    const int64_t t_acc0 = ggml_time_us();
     if (gsmpl->grmr && accept_grammar) {
         llama_sampler_accept(gsmpl->grmr, token);
     }
 
     llama_sampler_accept(gsmpl->chain, token);
+    if (is_generated) {
+        gsmpl->stats.t_accept += ggml_time_us() - t_acc0;
+    }
 
     gsmpl->prev.push_back(token);
 }
@@ -663,6 +674,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .fast_extra  = */ gsmpl->fast_extra,
         /* .fast_i_top_k = */ gsmpl->fast_i_top_k,
         /* .fast_thr     = */ gsmpl->fast_thr,
+        /* .stats        = */ {},
     };
 }
 
@@ -709,6 +721,15 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         // note: the sampling time includes the samplers time + extra time spent in common/sampling
         LOG_INF("%s:    sampling time = %10.2f ms\n", __func__, t_sampling_ms);
         LOG_INF("%s:    samplers time = %10.2f ms / %5d tokens\n", __func__, data.t_sample_ms, data.n_sample);
+
+        const char * env = getenv("LLAMA_SAMPLING_STATS");
+        if (env && atoi(env) != 0) {
+            const auto & st = gsmpl->stats;
+            LOG_INF("%s: sampling stats: first %.2f ms / %d (%d fast), grammar check %.2f ms, resample fast %.2f ms / %d "
+                    "(%d fast tries failed), resample full %.2f ms / %d, accept %.2f ms\n", __func__,
+                    1e-3*st.t_first, st.n_first, st.n_first_fast, 1e-3*st.t_check, 1e-3*st.t_res_fast, st.n_res_fast,
+                    st.n_res_fast_fail, 1e-3*st.t_res_full, st.n_res_full, 1e-3*st.t_accept);
+        }
     }
 
     if (ctx) {
@@ -757,6 +778,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
     // the fast path needs the whole chain after the grammar and the reasoning budget, which are applied to all tokens
+    const int64_t t_first0 = ggml_time_us();
     const bool fast = gsmpl->fast_top_k > 0 && !(grammar_first && grammar_should_apply(gsmpl)) &&
         (!rbudget || common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING) &&
         gsmpl->set_logits_top(ctx, idx);
@@ -797,11 +819,16 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     id = cur_p.data[cur_p.selected].id;
 
+    gsmpl->stats.t_first += ggml_time_us() - t_first0;
+    gsmpl->stats.n_first++;
+    gsmpl->stats.n_first_fast += fast;
+
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;
     }
 
     // check if it the sampled token fits the grammar (grammar-based rejection sampling)
+    const int64_t t_check0 = ggml_time_us();
     {
         llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
         llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
@@ -809,10 +836,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_sampler_apply(grmr, &single_token_data_array);
 
         const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
+        gsmpl->stats.t_check += ggml_time_us() - t_check0;
         if (is_valid) {
             return id;
         }
     }
+    const int64_t t_res0 = ggml_time_us();
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
@@ -839,7 +868,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                 resampled = true;
                 break;
             }
+            gsmpl->stats.n_res_fast_fail++;
         }
+    }
+    if (resampled) {
+        gsmpl->stats.t_res_fast += ggml_time_us() - t_res0;
+        gsmpl->stats.n_res_fast++;
     }
 
     if (!resampled) {
@@ -865,6 +899,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
 
         llama_sampler_apply(chain, &cur_p);
+
+        gsmpl->stats.t_res_full += ggml_time_us() - t_res0;
+        gsmpl->stats.n_res_full++;
     }
 
     GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");

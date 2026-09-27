@@ -15,11 +15,12 @@ PROMPT="Describe three GPUs as a JSON array of objects with the fields name, ven
 for GRAMMAR in "" "--grammar-file grammars/json_arr.gbnf"; do
     echo "=== ${GRAMMAR:-no grammar}"
     for F in 0 1; do
-        OUT=$(LLAMA_SAMPLING_FAST_TOP_K=${F} "${BIN}/llama-completion" -m "${MODEL}" -ngl 99 -fa on -sm layer -no-cnv \
+        OUT=$(LLAMA_SAMPLING_STATS=1 LLAMA_SAMPLING_FAST_TOP_K=${F} "${BIN}/llama-completion" -m "${MODEL}" -ngl 99 -fa on -sm layer -no-cnv \
             -n 160 --seed 7 --temp 0.8 --top-k 40 --top-p 0.95 --min-p 0.05 --frequency-penalty 0.8 --repeat-penalty 1.1 \
             ${GRAMMAR} -p "${PROMPT}" --no-display-prompt 2> /tmp/sampling-fast-${F}.log)
         echo "${OUT}" > /tmp/sampling-fast-${F}.txt
         printf 'fast=%s: %s\n' "${F}" "$(grep -E 'sampling time|eval time' /tmp/sampling-fast-${F}.log | grep -v prompt | sed -E 's/.*: +//' | tr '\n' ' ')"
+        grep -E "sampling stats" /tmp/sampling-fast-${F}.log | sed -E 's/.*sampling stats: /        /'
     done
     if cmp -s /tmp/sampling-fast-0.txt /tmp/sampling-fast-1.txt; then
         echo "OK   same text"
