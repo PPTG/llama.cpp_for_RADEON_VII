@@ -48,8 +48,9 @@ genq8() {
     env "$@" "${BIN}/llama-completion" -m "${MODEL}" -ngl 99 -fa on -sm none -ctk q8_0 -ctv q8_0 -no-cnv --temp 0 -n 64 \
         -p "${PROMPT}" --no-display-prompt 2>/dev/null
 }
-Q8NEW=$(genq8)
-Q8OLD=$(genq8 GGML_CUDA_FA_TILE_Q8=0)
+# the f16 conversion path uses the normal tile config, compare with the same config (GGML_CUDA_FA_Q8_CFG=0)
+Q8NEW=$(genq8 GGML_CUDA_FA_Q8_CFG=0)
+Q8OLD=$(genq8 GGML_CUDA_FA_Q8_CFG=0 GGML_CUDA_FA_TILE_Q8=0)
 if [ -n "${Q8NEW}" ] && [ "${Q8NEW}" == "${Q8OLD}" ]; then
     echo "OK   q8_0 KV: FA tile q8_0 == f16 conversion"
 else
@@ -59,13 +60,14 @@ else
 fi
 
 # q8_0 KV cache: the Hadamard rotation fused into the cache store / attn_output quantization must not change the text
+Q8DEF=$(genq8)
 Q8FWHT=$(genq8 GGML_CUDA_FUSE_FWHT=0)
-if [ -n "${Q8NEW}" ] && [ "${Q8NEW}" == "${Q8FWHT}" ]; then
+if [ -n "${Q8DEF}" ] && [ "${Q8DEF}" == "${Q8FWHT}" ]; then
     echo "OK   q8_0 KV: default == GGML_CUDA_FUSE_FWHT=0"
 else
     echo "DIFF q8_0 KV: default != GGML_CUDA_FUSE_FWHT=0"
     echo "--- GGML_CUDA_FUSE_FWHT=0: $(echo "${Q8FWHT}" | head -c 300)"
-    echo "--- default:               $(echo "${Q8NEW}" | head -c 300)"
+    echo "--- default:               $(echo "${Q8DEF}" | head -c 300)"
 fi
 
 NOFUSE=$(gen GGML_CUDA_DISABLE_FUSION=1)

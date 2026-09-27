@@ -373,30 +373,26 @@ static constexpr __device__ int ggml_cuda_fattn_tile_get_nbatch_K(const int DKQ,
     return (ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols) >> 23) & ((1 << 9) - 1);
 }
 
-// Tuning variants of the tile kernel that reads a q8_0 K/V cache (GGML_CUDA_FA_Q8_CFG=<n>), for the token generation
+// Tuning variants of the tile kernel that reads a q8_0 K/V cache (GGML_CUDA_FA_Q8_CFG=0/2/3), for the token generation
 // shapes of Gemma 4: head size 512 with GQA 8 (8 columns) and head size 256 with GQA 2 (2 columns). 0 or a variant that
 // is not defined here use the normal config. Packed as in GGML_CUDA_FATTN_TILE_CONFIG_CASE.
 #define GGML_CUDA_FATTN_TILE_Q8_CFG(nthreads, occupancy, nbatch_fa, nbatch_K) \
     (((nthreads) << 0) | ((occupancy) << 10) | ((nbatch_fa) << 14) | ((nbatch_K) << 23))
 
 static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_q8_config(const int DKQ, const int ncols, const int cfg) {
+    // gfx906 (fa-q8-cfg.sh), 128 threads, 128 KV rows with 64 K columns and 128 KV rows with 128 K columns per step were
+    // slower and were removed
     if (DKQ == 512 && ncols == 8) {
         switch (cfg) {
-            case 1: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2, 128,  64);
             case 2: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2,  64, 128);
             case 3: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 3,  64,  64);
-            case 4: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2, 128, 128);
-            case 5: return GGML_CUDA_FATTN_TILE_Q8_CFG(128, 4,  64,  64);
             default: return 0;
         }
     }
     if (DKQ == 256 && ncols == 2) {
         switch (cfg) {
-            case 1: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2, 256,  64);
             case 2: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2, 128, 128);
             case 3: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 3, 128,  64);
-            case 4: return GGML_CUDA_FATTN_TILE_Q8_CFG(128, 4,  64,  64);
-            case 5: return GGML_CUDA_FATTN_TILE_Q8_CFG(128, 4, 128,  64);
             default: return 0;
         }
     }
@@ -416,12 +412,22 @@ static __host__ uint32_t ggml_cuda_fattn_tile_get_config_cfg(const int DKQ, cons
     return cfg != 0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols, cc);
 }
 
-static int ggml_cuda_fattn_tile_q8_cfg_env() {
+// variant from GGML_CUDA_FA_Q8_CFG, else the fastest on gfx906 (fa-q8-cfg.sh): occupancy 3 for head 512,
+// 128 K columns per step for head 256
+static int ggml_cuda_fattn_tile_q8_cfg_env(const int DKQ) {
     static const int cfg = [] {
         const char * env = getenv("GGML_CUDA_FA_Q8_CFG");
-        return env == nullptr ? 0 : atoi(env);
+        return env == nullptr ? -1 : atoi(env);
     }();
-    return cfg;
+    if (cfg >= 0) {
+        return cfg;
+    }
+#ifdef GGML_USE_HIP
+    return DKQ == 512 ? 3 : 2;
+#else
+    GGML_UNUSED(DKQ);
+    return 0;
+#endif // GGML_USE_HIP
 }
 
 // TODO: deduplicate with mma-f16
@@ -1345,14 +1351,11 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             // tuning variants only for the columns of the Gemma 4 shapes (GQA 8 for head 512, GQA 2 for head 256)
             auto launch_q8 = [&](auto cols_per_block_c) {
                 constexpr int cols_per_block = decltype(cols_per_block_c)::value;
-                constexpr bool tunable = cols_per_block == ncols2 && ggml_cuda_fattn_tile_q8_config(DKQ, cols_per_block, 1) != 0;
+                constexpr bool tunable = cols_per_block == ncols2 && ggml_cuda_fattn_tile_q8_config(DKQ, cols_per_block, 2) != 0;
                 if constexpr (tunable) {
-                    switch (ggml_cuda_fattn_tile_q8_cfg_env()) {
-                        case 1: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 1)>{}); return;
+                    switch (ggml_cuda_fattn_tile_q8_cfg_env(DKQ)) {
                         case 2: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 2)>{}); return;
                         case 3: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 3)>{}); return;
-                        case 4: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 4)>{}); return;
-                        case 5: launch_q8_cfg(cols_per_block_c, std::integral_constant<int, ggml_cuda_fattn_tile_q8_cfg_eff(DKQ, cols_per_block, 5)>{}); return;
                         default: break;
                     }
                 }
