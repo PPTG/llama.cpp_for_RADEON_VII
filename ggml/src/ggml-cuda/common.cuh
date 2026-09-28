@@ -1530,7 +1530,8 @@ struct ggml_cuda_staged_copy_slot {
     cudaEvent_t h2d_done   = nullptr; // created on the dst device
 };
 
-static constexpr int GGML_CUDA_STAGED_COPY_SLOTS = 8;
+// slots are added while all are busy, up to this number
+static constexpr int GGML_CUDA_STAGED_COPY_SLOTS = 32;
 
 // Q8_1 copy of the last src1 quantized by MMVQ. Q, K, V (and gate, up) use the same src1, so it is quantized once.
 // Only valid within one graph compute: it is reset at the start of each graph compute.
@@ -1554,7 +1555,7 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
-    ggml_cuda_staged_copy_slot staged_copy_slots[GGML_CUDA_STAGED_COPY_SLOTS];
+    std::vector<ggml_cuda_staged_copy_slot> staged_copy_slots;
     int staged_copy_next = 0;
 
     ggml_cuda_mmvq_q8_cache mmvq_q8_cache;
