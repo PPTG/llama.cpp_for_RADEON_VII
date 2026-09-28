@@ -6,6 +6,9 @@ import collections
 import csv
 import sys
 
+if len(sys.argv) < 3:
+    sys.exit("usage: prof-tg.py <kernel_trace.csv> <n tokens> [n kernels]  (scripts/gfx906/profile-tg.sh records the trace)")
+
 rows = list(csv.DictReader(open(sys.argv[1])))
 n_tok = int(sys.argv[2])
 n_top = int(sys.argv[3]) if len(sys.argv) > 3 else 30
