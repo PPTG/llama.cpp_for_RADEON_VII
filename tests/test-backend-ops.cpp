@@ -11715,6 +11715,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({40, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({71, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 128, with_norm, bias_probs, gate, scale_w));
+                    test_cases.emplace_back(new test_topk_moe({128, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Gemma 4 26B A4B
+                    test_cases.emplace_back(new test_topk_moe({512, 5, 1, 1}, 16, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({129, 1, 1, 1}, 128, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
@@ -12320,6 +12322,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // MoE routing of a token (Gemma 4 26B A4B: 128 experts, 8 used, softmax + norm)
+    test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f));
+    test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, true, false, GATING_FUNC_SIGMOID, 0.0f));
 
     return test_cases;
 }
