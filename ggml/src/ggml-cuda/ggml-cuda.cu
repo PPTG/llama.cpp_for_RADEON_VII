@@ -4723,6 +4723,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // rms_norm -> mul -> rope -> reshape -> Hadamard mul_mat (the Q rotation for a quantized KV cache, rotation size =
+    // row size) as one kernel
+    if (ggml_cuda_fuse_fwht_enabled() && node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes) {
+        ggml_tensor * mul  = cgraph->nodes[i + 1];
+        ggml_tensor * rope = cgraph->nodes[i + 2];
+        ggml_tensor * resh = cgraph->nodes[i + 3];
+        ggml_tensor * fwht = cgraph->nodes[i + 4];
+        const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+        const int     out[] = { i + 4 };
+        if (mul->op == GGML_OP_MUL && (mul->src[0] == node || mul->src[1] == node) &&
+                rope->op == GGML_OP_ROPE && resh->op == GGML_OP_RESHAPE && resh->src[0] == rope &&
+                ggml_cuda_is_fwht_node(fwht) && fwht->src[1] == resh && fwht->src[1]->type == GGML_TYPE_F32 &&
+                ggml_cuda_should_fuse_rms_norm_mul_rope(node, mul, rope) && ggml_is_contiguous(rope) &&
+                fwht->ne[0] == rope->ne[0] && (fwht->ne[0] == 256 || fwht->ne[0] == 512) &&
+                ggml_can_fuse_subgraph(cgraph, i, 5, ops, out, 1)) {
+            ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, mul, rope, nullptr, fwht);
+            return 4;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;

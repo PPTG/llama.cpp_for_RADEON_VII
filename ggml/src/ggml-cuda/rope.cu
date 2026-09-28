@@ -2,6 +2,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "rope.cuh"
+#include "fwht.cuh"
 
 struct rope_corr_dims {
     float v[2];
@@ -705,9 +706,10 @@ void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rope
     ggml_cuda_op_rope_impl<true>(ctx, rope, set_rows);
 }
 
-// fused RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)
+// fused RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS, or + RESHAPE + Hadamard MUL_MAT with fwht_n == ncols)
 // one block per row: block_reduce gives the norm scale, then each thread applies mul and rope to the elements it owns
-template <int block_size, bool has_ff, typename D>
+// fwht_n > 0: the roped row goes to shared memory, one warp applies the Hadamard transform (same math as fwht_cuda)
+template <int block_size, bool has_ff, typename D, int fwht_n = 0>
 static __global__ void rms_norm_mul_rope_f32(
         const float * x, D * dst, const int ncols,
         const int64_t s01, const int64_t s02, const int64_t s03,
@@ -722,7 +724,7 @@ static __global__ void rms_norm_mul_rope_f32(
         const rope_corr_dims corr_dims, const float theta_scale,
         const float * freq_factors,
         const int64_t * row_indices, const int set_rows_stride,
-        const bool is_neox) {
+        const bool is_neox, const float fwht_scale) {
     ggml_cuda_pdl_lc();
     const int row     = blockIdx.x;
     const int channel = blockIdx.y;
@@ -755,6 +757,15 @@ static __global__ void rms_norm_mul_rope_f32(
     }
     dst += idst;
 
+    float * s_row = s_sum + 32; // fwht_n > 0: the roped row
+    auto store = [&](const int i, const float v) {
+        if constexpr (fwht_n > 0) {
+            s_row[i] = v;
+        } else {
+            dst[i] = ggml_cuda_cast<D>(v);
+        }
+    };
+
     for (int i0 = 2*tid; i0 < ncols; i0 += 2*block_size) {
         int ix0;
         int ix1;
@@ -770,8 +781,8 @@ static __global__ void rms_norm_mul_rope_f32(
         const float x1 = scale * x[ix1] * mul[fastmodulo(ix1, mul_ncols_packed)];
 
         if (i0 >= n_dims) {
-            dst[ix0] = ggml_cuda_cast<D>(x0);
-            dst[ix1] = ggml_cuda_cast<D>(x1);
+            store(ix0, x0);
+            store(ix1, x1);
             continue;
         }
 
@@ -782,8 +793,26 @@ static __global__ void rms_norm_mul_rope_f32(
         float sin_theta;
         rope_yarn<true>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
 
-        dst[ix0] = ggml_cuda_cast<D>(x0*cos_theta - x1*sin_theta);
-        dst[ix1] = ggml_cuda_cast<D>(x0*sin_theta + x1*cos_theta);
+        store(ix0, x0*cos_theta - x1*sin_theta);
+        store(ix1, x0*sin_theta + x1*cos_theta);
+    }
+
+    if constexpr (fwht_n > 0) {
+        constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+        constexpr int el_w      = fwht_n / warp_size;
+        __syncthreads();
+        if (tid < warp_size) {
+            float reg[el_w];
+#pragma unroll
+            for (int i = 0; i < el_w; ++i) {
+                reg[i] = s_row[i*warp_size + tid] * fwht_scale;
+            }
+            fwht_row<fwht_n>(reg, tid);
+#pragma unroll
+            for (int i = 0; i < el_w; ++i) {
+                dst[i*warp_size + tid] = ggml_cuda_cast<D>(reg[i]);
+            }
+        }
     }
 }
 
@@ -803,7 +832,7 @@ static void rms_norm_mul_rope_cuda(
         const rope_corr_dims corr_dims,
         const float * freq_factors,
         const int64_t * row_indices, const int set_rows_stride,
-        const bool is_neox, cudaStream_t stream) {
+        const bool is_neox, const int fwht_n, cudaStream_t stream) {
     GGML_ASSERT(ncols % 2 == 0);
 
     const dim3 blocks_num(nrows, nchannels, nsamples);
@@ -815,43 +844,36 @@ static void rms_norm_mul_rope_cuda(
     const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
     const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
 
-    if (ncols < 1024) {
-        const dim3 block_dims(256, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32*sizeof(float), stream};
-        if (freq_factors == nullptr) {
-            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<256, false, D>, launch_params,
-                x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
-                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
-                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
-        } else {
-            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<256, true, D>, launch_params,
-                x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
-                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
-                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
-        }
+    const float fwht_scale = fwht_n > 0 ? 1.0f/sqrtf((float) fwht_n) : 0.0f;
+    GGML_ASSERT(fwht_n == 0 || (fwht_n == ncols && ncols < 1024));
+
+    auto launch = [&](auto kernel, const int block_size) {
+        const dim3 block_dims(block_size, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, (32 + fwht_n)*sizeof(float), stream};
+        ggml_cuda_kernel_launch(kernel, launch_params,
+            x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
+            mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+            n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
+            freq_factors, row_indices, set_rows_stride, is_neox, fwht_scale);
+    };
+
+    if (fwht_n == 256) {
+        freq_factors == nullptr ? launch(rms_norm_mul_rope_f32<256, false, D, 256>, 256)
+                                : launch(rms_norm_mul_rope_f32<256, true,  D, 256>, 256);
+    } else if (fwht_n == 512) {
+        freq_factors == nullptr ? launch(rms_norm_mul_rope_f32<256, false, D, 512>, 256)
+                                : launch(rms_norm_mul_rope_f32<256, true,  D, 512>, 256);
+    } else if (ncols < 1024) {
+        freq_factors == nullptr ? launch(rms_norm_mul_rope_f32<256, false, D>, 256)
+                                : launch(rms_norm_mul_rope_f32<256, true,  D>, 256);
     } else {
-        const dim3 block_dims(1024, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32*sizeof(float), stream};
-        if (freq_factors == nullptr) {
-            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<1024, false, D>, launch_params,
-                x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
-                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
-                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
-        } else {
-            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<1024, true, D>, launch_params,
-                x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
-                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
-                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
-        }
+        freq_factors == nullptr ? launch(rms_norm_mul_rope_f32<1024, false, D>, 1024)
+                                : launch(rms_norm_mul_rope_f32<1024, true,  D>, 1024);
     }
 }
 
 void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
-        ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows) {
+        ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows, ggml_tensor * fwht) {
     const ggml_tensor * x = rms_norm->src[0];
     const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
 
@@ -867,6 +889,14 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     ggml_type       dst_type        = rope->type;
     const int64_t * row_indices     = nullptr;
     int             set_rows_stride = 0;
+
+    // Hadamard mul_mat of the (contiguous) rope output: same element order, written to its output
+    int fwht_n = 0;
+    if (fwht != nullptr) {
+        GGML_ASSERT(set_rows == nullptr && ggml_is_contiguous(rope) && ggml_is_contiguous(fwht));
+        dst_d  = fwht->data;
+        fwht_n = fwht->ne[0];
+    }
 
     if (set_rows != nullptr) {
         dst_d           = set_rows->data;
@@ -927,14 +957,14 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
             mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
             n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
-            freq_factors, row_indices, set_rows_stride, is_neox, stream);
+            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, stream);
     } else if (dst_type == GGML_TYPE_F16) {
         rms_norm_mul_rope_cuda((const float *) x->data, (half *) dst_d,
             x->ne[0], x->ne[1], x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps,
             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
             mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
             n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
-            freq_factors, row_indices, set_rows_stride, is_neox, stream);
+            freq_factors, row_indices, set_rows_stride, is_neox, fwht_n, stream);
     } else {
         GGML_ABORT("fatal error");
     }

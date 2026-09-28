@@ -2830,6 +2830,75 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
+// rms_norm -> mul -> rope -> reshape -> Hadamard mul_mat -> reshape: the Q rotation of a quantized KV cache as in
+// Gemma 4 (rotation size = head size, neox rope, optional freq factors)
+struct test_rms_norm_mul_rope_hadamard : public test_case {
+    const std::array<int64_t, 3> ne; // head size, heads, tokens
+    const bool freq_factors;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_ROPE_HADAMARD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, freq_factors);
+    }
+
+    test_rms_norm_mul_rope_hadamard(std::array<int64_t, 3> ne = {256, 16, 1}, bool freq_factors = false)
+        : ne(ne), freq_factors(freq_factors) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d = ne[0];
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, ne[1], ne[2]);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
+        ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, d);
+        ggml_set_name(h, "hadamard");
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2]);
+        ggml_tensor * ff  = freq_factors ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d/2) : nullptr;
+        if (ff) {
+            ggml_set_name(ff, "ff");
+        }
+
+        ggml_tensor * a = ggml_rms_norm(ctx, x, 1e-6f);
+        a = ggml_mul(ctx, a, w);
+        a = ggml_rope_ext(ctx, a, pos, ff, d, GGML_ROPE_TYPE_NEOX, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        ggml_tensor * r = ggml_reshape_2d(ctx, a, d, ggml_nelements(a)/d);
+        r = ggml_mul_mat(ctx, h, r);
+        ggml_mul_mat_set_hint(r, GGML_HINT_SRC0_IS_HADAMARD);
+        r = ggml_reshape_3d(ctx, r, d, ne[1], ne[2]);
+        ggml_set_name(r, "out");
+        return r;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "hadamard") == 0) {
+                const int64_t n = t->ne[0];
+                std::vector<float> data(n*n);
+                for (int64_t r = 0; r < n; r++) {
+                    for (int64_t i = 0; i < n; i++) {
+                        data[r*n + i] = (__builtin_popcountll(r & i) % 2 == 0 ? 1.0f : -1.0f) / sqrtf((float) n);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "ff") == 0) {
+                init_tensor_uniform(t, 0.5f, 2.0f);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & value : data) {
+                    value = rand() % 4096;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_ARGMAX
 struct test_argmax : public test_case {
     const ggml_type type;
@@ -10368,6 +10437,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
 
+    for (int64_t d : { 256, 512 }) {
+        for (int64_t n_tokens : { 1, 3 }) {
+            for (bool ff : { false, true }) {
+                test_cases.emplace_back(new test_rms_norm_mul_rope_hadamard({ d, 16, n_tokens }, ff));
+            }
+        }
+    }
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
 
