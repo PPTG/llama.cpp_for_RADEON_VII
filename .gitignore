@@ -157,3 +157,4 @@ AGENTS.local.md
 # gfx906 benchmark results
 /results-gfx906/
 /results-gfx906-*.tar.gz
+/ggml/src/ggml-cuda/mmq-config-gcn-local.h

@@ -11839,6 +11839,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, true,  1408, 1, 2816));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2816, 1, 704));
 
+    // prompt processing shapes of Gemma 4 26B A4B (ubatch 512 / 1024), used to tune MMQ per shape
+    for (int64_t n : { 512, 1024 }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                {4096, 2816}, {2048, 2816}, {2816, 4096}, {2112, 2816}, {2816, 2112}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, true,  1408, n, 2816));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2816, n, 704));
+    }
+
     // token generation attention of Gemma 4 26B A4B: SWA layers (head 256, 8 KV heads, GQA 2, window 1024 + ubatch)
     // and global layers (head 512, 2 KV heads, GQA 8) at long context
     // permute {0, 2, 1, 3}: the KV cache layout of the model (rows of all KV heads interleaved)
