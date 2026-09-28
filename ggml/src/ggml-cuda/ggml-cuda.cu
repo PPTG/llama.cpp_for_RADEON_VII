@@ -2551,31 +2551,41 @@ static bool ggml_cuda_use_staged_copy() {
 }
 
 static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst, void * dst, const void * src, const size_t nbytes) {
-    // a free slot (its last H2D done): reusing a busy one makes the src stream wait for the dst stream, e.g. for the
-    // H2D of a layer split boundary queued behind the previous ubatch of the other GPU, which serializes the GPUs
+    // a free slot (its last H2D done) that is large enough: reusing a busy slot makes the src stream wait for the dst
+    // stream (e.g. for the H2D of a layer split boundary queued behind the previous ubatch of the other GPU), growing a
+    // slot frees pinned memory, which synchronizes the device; the smallest free slot that fits, else a new slot
     std::vector<ggml_cuda_staged_copy_slot> & slots = ctx_src->staged_copy_slots;
     const int n_slots = (int) slots.size();
-    int idx = -1;
-    for (int k = 0; k < n_slots; ++k) {
-        const int i = (ctx_src->staged_copy_next + k) % n_slots;
-        if (!slots[i].used) {
+    int idx      = -1;
+    int idx_free = -1; // largest free slot
+    for (int i = 0; i < n_slots; ++i) {
+        bool free = !slots[i].used;
+        if (!free) {
+            const cudaError_t err = cudaEventQuery(slots[i].h2d_done);
+            if (err == cudaSuccess) {
+                free = true;
+            } else if (err != cudaErrorNotReady) {
+                CUDA_CHECK(err);
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+        if (!free) {
+            continue;
+        }
+        if (slots[i].size >= nbytes && (idx < 0 || slots[i].size < slots[idx].size)) {
             idx = i;
-            break;
         }
-        const cudaError_t err = cudaEventQuery(slots[i].h2d_done);
-        if (err == cudaSuccess) {
-            idx = i;
-            break;
+        if (idx_free < 0 || slots[i].size > slots[idx_free].size) {
+            idx_free = i;
         }
-        if (err != cudaErrorNotReady) {
-            CUDA_CHECK(err);
-        }
-        (void) cudaGetLastError();
     }
     if (idx < 0) {
         if (n_slots < GGML_CUDA_STAGED_COPY_SLOTS) {
             slots.emplace_back();
             idx = n_slots;
+        } else if (idx_free >= 0) {
+            idx = idx_free; // grows
         } else {
             idx = ctx_src->staged_copy_next % n_slots; // all busy: wait for the oldest
         }
