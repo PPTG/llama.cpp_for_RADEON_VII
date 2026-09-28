@@ -293,7 +293,7 @@ __global__ void topk_moe_rank_cuda(const float * logits,
     static_assert(n_experts % WARP_SIZE == 0 && n_experts % n_threads == 0, "bad topk_moe_rank config");
     constexpr int experts_per_thread = n_experts / WARP_SIZE;
 
-    __shared__ float s_wt[n_experts];
+    __shared__ __align__(16) float s_wt[n_experts]; // read as float4
     __shared__ float s_sel[n_experts];
     __shared__ int   s_selid[n_experts];
 
