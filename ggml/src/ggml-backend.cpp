@@ -1671,6 +1671,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // with pipeline parallelism the user inputs of all splits of a backend are copied at its first split of the graph:
+    // the copy waits on the host for the event of the backend, which at a later split was already recorded by an
+    // earlier split of this graph, so the host would wait for all its work of this graph before queueing more (e.g. the
+    // mask of the global layers first used after a split of the other GPU, LLAMA_KV_SPLIT_HEADS)
+    std::vector<bool> backend_inputs_copied(sched->n_backends, false);
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1695,12 +1701,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sched->n_copies > 1 && !backend_inputs_copied[split_backend_id]) {
+            backend_inputs_copied[split_backend_id] = true;
+            bool synced = false;
+            for (int s = split_id; s < sched->n_splits; s++) {
+                if (splits[s].backend_id != split_backend_id) {
+                    continue;
+                }
+                for (int k = 0; k < splits[s].n_inputs; k++) {
+                    struct ggml_tensor * input = splits[s].inputs[k];
+                    if (!(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                        continue;
+                    }
+                    if (!synced) {
+                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                        } else {
+                            ggml_backend_synchronize(split_backend);
+                        }
+                        synced = true;
+                    }
+                    ggml_backend_tensor_copy(input, tensor_copy(input, split_backend_id, sched->cur_copy));
+                }
+            }
+        }
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) && sched->n_copies > 1) {
+                continue; // copied at the first split of the backend
+            }
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
