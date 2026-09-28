@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -89,6 +90,18 @@ bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) {
 ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
     return buft->device;
+}
+
+ggml_backend_buffer_type_t ggml_backend_buft_alias(ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(buft);
+    static std::mutex mutex;
+    static std::unordered_map<ggml_backend_buffer_type_t, ggml_backend_buffer_type_t> aliases;
+    std::lock_guard<std::mutex> lock(mutex);
+    ggml_backend_buffer_type_t & alias = aliases[buft];
+    if (alias == nullptr) {
+        alias = new ggml_backend_buffer_type { buft->iface, buft->device, buft->context };
+    }
+    return alias;
 }
 
 // backend buffer
@@ -1048,6 +1061,11 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
             tensor_backend_id = tensor_backend_id(t->view_src);
         }
         if (tensor_backend_id != -1) {
+            // two backends of the same device (e.g. two streams): not ordered, the copy orders them
+            if (tensor_backend_id != backend_id &&
+                ggml_backend_get_device(sched->backends[tensor_backend_id]) == ggml_backend_get_device(sched->backends[backend_id])) {
+                return false;
+            }
             buft = sched->bufts[tensor_backend_id];
         }
     }
@@ -1662,12 +1680,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // this split, the allocator may have reused buffer regions across splits
         // (not between two GPU backends: every backend has its own buffers and the copies between them are ordered on
         // the GPU streams; a host wait here would serialize independent work of two GPUs, GGML_SCHED_GPU_SPLIT_SYNC=1
-        // restores it)
+        // restores it; two backends of the same device still wait)
         static const bool gpu_split_sync = getenv("GGML_SCHED_GPU_SPLIT_SYNC") != nullptr && atoi(getenv("GGML_SCHED_GPU_SPLIT_SYNC")) != 0;
         const bool both_gpu = prev_backend_id >= 0 &&
             ggml_backend_dev_type(ggml_backend_get_device(sched->backends[prev_backend_id])) == GGML_BACKEND_DEVICE_TYPE_GPU &&
             ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU;
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && (!both_gpu || gpu_split_sync)) {
+        const bool same_device = prev_backend_id >= 0 &&
+            ggml_backend_get_device(sched->backends[prev_backend_id]) == ggml_backend_get_device(split_backend);
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && (!both_gpu || gpu_split_sync || same_device)) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {

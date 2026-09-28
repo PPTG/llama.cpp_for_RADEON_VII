@@ -338,6 +338,34 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        // LLAMA_KV_SPLIT_HEADS: a second backend (stream) per GPU for the attention of the KV heads of the layers of the
+        // other GPU, so that it does not queue behind the work of the next layers of the GPU and the two GPUs overlap
+        // on consecutive ubatches (pipeline parallelism); LLAMA_KV_SPLIT_STREAM=0 disables it
+        {
+            static const bool split_stream = [] {
+                const char * heads  = getenv("LLAMA_KV_SPLIT_HEADS");
+                const char * stream = getenv("LLAMA_KV_SPLIT_STREAM");
+                return heads != nullptr && atoi(heads) != 0 && (stream == nullptr || atoi(stream) != 0);
+            }();
+            int n_gpu = 0;
+            for (const auto & dev : model.devices) {
+                n_gpu += ggml_backend_dev_type(dev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
+            }
+            if (split_stream && n_gpu > 1 && model.split_mode() == LLAMA_SPLIT_MODE_LAYER) {
+                for (const auto & dev : model.devices) {
+                    if (ggml_backend_dev_type(dev.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        continue;
+                    }
+                    ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+                    if (backend == nullptr) {
+                        throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+                    }
+                    backends.emplace_back(backend);
+                }
+                LLAMA_LOG_INFO("%s: LLAMA_KV_SPLIT_HEADS: second stream per GPU for the split attention\n", __func__);
+            }
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -404,9 +432,18 @@ llama_context::llama_context(
         backend_ptrs.clear();
         backend_buf_exp_size.clear();
 
-        for (auto & backend : backends) {
+        for (size_t ib = 0; ib < backends.size(); ++ib) {
+            auto & backend = backends[ib];
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+
+            // a second backend of a device gets its own compute buffer
+            for (size_t jb = 0; jb < ib; ++jb) {
+                if (ggml_backend_get_device(backends[jb].get()) == ggml_backend_get_device(backend.get())) {
+                    buft = ggml_backend_buft_alias(buft);
+                    break;
+                }
+            }
 
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
@@ -2621,6 +2658,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
                             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
                         }
+                        break; // the first backend of the device, not its second stream
                     }
                 }
             }

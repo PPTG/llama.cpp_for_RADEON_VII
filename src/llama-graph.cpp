@@ -2747,18 +2747,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 }
 
 // backend of the scheduler that runs on the device of buffer buf
-static ggml_backend_t llama_graph_backend_of_buffer(ggml_backend_sched_t sched, ggml_backend_buffer_t buf) {
+// the first backend of the device of the buffer, or with last the last one (the second stream of the device if any)
+static ggml_backend_t llama_graph_backend_of_buffer(ggml_backend_sched_t sched, ggml_backend_buffer_t buf, bool last = false) {
     if (buf == nullptr) {
         return nullptr;
     }
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+    ggml_backend_t res = nullptr;
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
         if (ggml_backend_get_device(backend) == dev) {
-            return backend;
+            res = backend;
+            if (!last) {
+                break;
+            }
         }
     }
-    return nullptr;
+    return res;
 }
 
 ggml_tensor * llm_graph_context::build_attn_split_heads(
@@ -2785,9 +2790,10 @@ ggml_tensor * llm_graph_context::build_attn_split_heads(
 
     // every op of a part is pinned to the device of its KV cache: an op without a pinned backend gets the backend of
     // the previous node in the graph, which could pull the whole KV cache of the other part over PCIe
+    // the part on the other device goes to its second stream if there is one (LLAMA_KV_SPLIT_STREAM)
     ggml_backend_t backends[2] = {
         llama_graph_backend_of_buffer(sched, k0->view_src ? k0->view_src->buffer : k0->buffer),
-        llama_graph_backend_of_buffer(sched, k1->view_src ? k1->view_src->buffer : k1->buffer),
+        llama_graph_backend_of_buffer(sched, k1->view_src ? k1->view_src->buffer : k1->buffer, /*last =*/ true),
     };
     auto pin = [&](ggml_tensor * t, int part) {
         if (backends[part]) {
