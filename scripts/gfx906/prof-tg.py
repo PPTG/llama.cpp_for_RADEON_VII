@@ -3,7 +3,8 @@
 # (mul_mat_q, the batched matmul), in us per token.
 # usage: scripts/gfx906/prof-tg.py <kernel_trace.csv> <n tokens> [n kernels]
 # env:   SEQ=<kernel name part> also prints the kernels around one call of that kernel (duration, idle gap before it)
-#        GAPS=1 prints the idle time of each GPU between kernels, by the kernel that follows the gap
+#        GAPS=1 prints the idle time of each GPU between kernels, by the kernel that follows the gap, and the time when
+#        no GPU runs a kernel (the real loss of a split over GPUs: copies through the host, syncs, launches)
 import collections
 import csv
 import os
@@ -87,3 +88,24 @@ if os.environ.get("GAPS"):
         print(f"{'us/tok':>8} {'n/tok':>6} {'avg us':>7} {'max us':>7}  after -> before")
         for (a, b), (ns, n, mx) in sorted(gaps.items(), key=lambda kv: -kv[1][0])[:12]:
             print(f"{ns/1e3/n_tok:8.1f} {n/n_tok:6.1f} {ns/1e3/n:7.2f} {mx/1e3:7.2f}  {a} -> {b}")
+
+    # time when no GPU runs anything, attributed to the kernels around the gap
+    ev = sorted(tg, key=lambda r: int(r[c_start]))
+    both = collections.defaultdict(lambda: [0, 0, 0])
+    end_max, last = int(ev[0][c_end]), ev[0]
+    for r in ev[1:]:
+        st = int(r[c_start])
+        if st > end_max:
+            gap = st - end_max
+            ag = lambda x: (x[c_agent].replace("Agent ", "") + ":") if c_agent else ""
+            g = both[(ag(last) + short(last[c_name])[:42], ag(r) + short(r[c_name])[:42])]
+            g[0] += gap
+            g[1] += 1
+            g[2] = max(g[2], gap)
+        if int(r[c_end]) > end_max:
+            end_max, last = int(r[c_end]), r
+    tot = sum(g[0] for g in both.values())
+    print(f"\nno GPU busy: {tot/1e3/n_tok:.0f} us/token of wall {wall/1e3/n_tok:.0f} us/token")
+    print(f"{'us/tok':>8} {'n/tok':>6} {'avg us':>7} {'max us':>7}  last kernel before -> first kernel after (agent:)")
+    for (a, b), (ns, n, mx) in sorted(both.items(), key=lambda kv: -kv[1][0])[:15]:
+        print(f"{ns/1e3/n_tok:8.1f} {n/n_tok:6.1f} {ns/1e3/n:7.2f} {mx/1e3:7.2f}  {a} -> {b}")
