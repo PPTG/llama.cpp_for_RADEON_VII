@@ -2,7 +2,8 @@
 # Token generation part of a rocprofv3 kernel_trace.csv: kernels that start after the last prefill kernel
 # (mul_mat_q, the batched matmul), in us per token.
 # usage: scripts/gfx906/prof-tg.py <kernel_trace.csv> <n tokens> [n kernels]
-# env:   SEQ=<kernel name part> also prints the kernels around one call of that kernel (duration, idle gap before it)
+# env:   ALL=1 takes every kernel of the trace (prompt processing: scripts/gfx906/profile-pp.sh), <n tokens> = tokens processed
+#        SEQ=<kernel name part> also prints the kernels around one call of that kernel (duration, idle gap before it)
 #        GAPS=1 prints the idle time of each GPU between kernels, by the kernel that follows the gap, and the time when
 #        no GPU runs a kernel (the real loss of a split over GPUs: copies through the host, syncs, launches)
 #        note: the kernel trace itself stalls the queues (wall ~36 ms/token traced vs ~9 ms untraced with 2 GPUs), so
@@ -34,7 +35,7 @@ def short(name):
     return name.split(">(")[0] + ">" if "<" in name else name.split("(")[0]
 
 last_pp = max((int(r[c_start]) for r in rows if short(r[c_name]).startswith("mul_mat_q<")), default=0)
-tg = [r for r in rows if int(r[c_start]) > last_pp]
+tg = rows if os.environ.get("ALL") else [r for r in rows if int(r[c_start]) > last_pp]
 if not tg:
     sys.exit("no kernels after the last prefill kernel")
 
@@ -46,7 +47,7 @@ for r in tg:
 
 total = sum(s[0] for s in stats.values())
 wall  = max(int(r[c_end]) for r in tg) - min(int(r[c_start]) for r in tg)
-print(f"tg: {n_tok} tokens, {len(tg)/n_tok:.0f} kernels/token, kernel time {total/1e3/n_tok:.0f} us/token, "
+print(f"{'all' if os.environ.get('ALL') else 'tg'}: {n_tok} tokens, {len(tg)/n_tok:.0f} kernels/token, kernel time {total/1e3/n_tok:.0f} us/token, "
       f"wall {wall/1e3/n_tok:.0f} us/token")
 print(f"{'%':>6} {'us/tok':>8} {'calls/tok':>9} {'avg us':>8}  kernel")
 for name, (ns, calls) in sorted(stats.items(), key=lambda kv: -kv[1][0])[:n_top]:
