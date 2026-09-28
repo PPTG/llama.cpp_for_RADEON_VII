@@ -450,9 +450,14 @@ static int ggml_cuda_fattn_tile_pp_cfg_env(const int DKQ) {
         const char * env = getenv("GGML_CUDA_FA_PP_CFG");
         return env == nullptr ? 0 : atoi(env);
     }();
+    // head 256 default on HIP: 13 (gfx906, tune-fa-pp.sh: 5.19 -> 4.35 ms for the Gemma 4 SWA layers at ubatch 1024)
     static const int cfg_256 = [] {
         const char * env = getenv("GGML_CUDA_FA_PP_CFG_256");
+#ifdef GGML_USE_HIP
+        return env == nullptr ? 13 : atoi(env);
+#else
         return env == nullptr ? 0 : atoi(env);
+#endif // GGML_USE_HIP
     }();
     return DKQ == 512 ? cfg_512 : DKQ == 256 ? cfg_256 : 0;
 }
