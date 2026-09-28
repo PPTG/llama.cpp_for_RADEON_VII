@@ -3,6 +3,7 @@
 # (mul_mat_q, the batched matmul), in us per token.
 # usage: scripts/gfx906/prof-tg.py <kernel_trace.csv> <n tokens> [n kernels]
 # env:   SEQ=<kernel name part> also prints the kernels around one call of that kernel (duration, idle gap before it)
+#        GAPS=1 prints the idle time of each GPU between kernels, by the kernel that follows the gap
 import collections
 import csv
 import os
@@ -65,3 +66,24 @@ if seq:
         dur = (int(r[c_end]) - int(r[c_start])) / 1e3
         gap = (int(r[c_start]) - int(near[j - 1][c_end])) / 1e3 if j > 0 else 0.0
         print(f"{'>' if j == j0 else ' '} {dur:8.2f} {gap:8.2f}  {short(r[c_name])[:100]}")
+
+if os.environ.get("GAPS"):
+    c_agent = next((k for k in rows[0].keys() if k in ("Agent_Id", "Agent_ID", "gpu-id", "GPU_ID")), None)
+    by_agent = collections.defaultdict(list)
+    for r in sorted(tg, key=lambda r: int(r[c_start])):
+        by_agent[r[c_agent] if c_agent else "all"].append(r)
+    print("\nidle gaps between kernels of the same GPU (gaps > 1 ms, e.g. waiting for the other GPU, are left out)")
+    for agent, rs in sorted(by_agent.items()):
+        gaps = collections.defaultdict(lambda: [0, 0, 0])
+        for prev, r in zip(rs, rs[1:]):
+            gap = int(r[c_start]) - int(prev[c_end])
+            if 0 < gap < 1000000:
+                g = gaps[(short(prev[c_name])[:45], short(r[c_name])[:45])]
+                g[0] += gap
+                g[1] += 1
+                g[2] = max(g[2], gap)
+        tot = sum(g[0] for g in gaps.values())
+        print(f"{agent}: idle {tot/1e3/n_tok:.0f} us/token")
+        print(f"{'us/tok':>8} {'n/tok':>6} {'avg us':>7} {'max us':>7}  after -> before")
+        for (a, b), (ns, n, mx) in sorted(gaps.items(), key=lambda kv: -kv[1][0])[:12]:
+            print(f"{ns/1e3/n_tok:8.1f} {n/n_tok:6.1f} {ns/1e3/n:7.2f} {mx/1e3:7.2f}  {a} -> {b}")

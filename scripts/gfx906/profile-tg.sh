@@ -3,7 +3,7 @@
 # marks where the token generation starts), then the kernels per token sorted by time (scripts/gfx906/prof-tg.py).
 #
 # usage: scripts/gfx906/profile-tg.sh [model.gguf] [build-dir]
-# env:   DEPTH=512 (context before the 32 tokens), SM=layer, KV=q8_0, TOP=40, SEQ=<kernel> (see prof-tg.py); LLAMA_KV_SPLIT_HEADS etc. are passed on
+# env:   DEPTH=512 (context before the 32 tokens), SM=layer, KV=q8_0, TOP=40, SEQ=<kernel>, GAPS=1 (see prof-tg.py); LLAMA_KV_SPLIT_HEADS etc. are passed on
 set -uo pipefail
 
 cd "$(dirname "$0")/../.."
