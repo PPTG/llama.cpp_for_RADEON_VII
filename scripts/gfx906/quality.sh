@@ -6,10 +6,12 @@
 #
 # usage: scripts/gfx906/quality.sh [model.gguf] [build-dir]
 # env:   CTX=4096 CHUNKS=2 (tokens per chunk and number of chunks; one variant takes ~CTX*CHUNKS*10 ms)
-#        VARIANTS="f16 q8-plain q8-tile q8 q8-split" (subset to run)
+#        VARIANTS="f16 q8-plain q8-tile q8 q8-split q8-b8" (subset to run)
 #        SANITY=1 (only the plain perplexity on the CPU vs the GPUs, see below)
 # variants: f16 KV | q8_0 KV without the fork kernels and fusions (conversion to f16, no fused Hadamard rotation) |
-#           q8_0 KV, FA tile kernel reading q8_0 | default (head 512 wave kernel) | default + LLAMA_KV_SPLIT_HEADS=1
+#           q8_0 KV, FA tile kernel reading q8_0 | default (head 512 wave kernel) | default + LLAMA_KV_SPLIT_HEADS=1 |
+#           default with 8 tokens per decode (the kernels of the speculative decoding verification)
+# results per model in results-gfx906/quality/<model name>/
 set -uo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -19,9 +21,9 @@ BUILD_DIR=${2:-build-dpp}
 BIN=${BUILD_DIR}/bin
 CTX=${CTX:-4096}
 CHUNKS=${CHUNKS:-2}
-VARIANTS=${VARIANTS:-"f16 q8-plain q8-tile q8 q8-split"}
+VARIANTS=${VARIANTS:-"f16 q8-plain q8-tile q8 q8-split q8-b8"}
 TEXT=wikitext-2-raw/wiki.test.raw
-OUT=results-gfx906/quality
+OUT=results-gfx906/quality/$(basename "${MODEL}" .gguf)
 mkdir -p "${OUT}"
 
 if [ ! -x "${BIN}/llama-perplexity" ]; then
@@ -68,7 +70,7 @@ fi
 run() {
     local name=$1; shift
     local log="${OUT}/${name}-c${CTX}-n${CHUNKS}.log"
-    env "$@" "${BIN}/llama-perplexity" "${COMMON[@]}" "${KV[@]}" -b 1 -ub 1 \
+    env "$@" "${BIN}/llama-perplexity" "${COMMON[@]}" "${KV[@]}" -b "${NB:-1}" -ub "${NB:-1}" \
         --kl-divergence-base "${BASE}" --kl-divergence > "${log}" 2>&1 || { echo "${name}: FAILED, see ${log}"; tail -5 "${log}"; return; }
     printf '%-9s PPL %s | KLD %s | same top %s | max KLD %s\n' "${name}" \
         "$(grep -m1 'Mean PPL(Q) ' "${log}" | sed -E 's/.*: +//')" \
@@ -85,6 +87,7 @@ for V in ${VARIANTS}; do
         q8-tile)  KV=(-ctk q8_0 -ctv q8_0); run q8-tile  GGML_CUDA_FA_Q8_WAVE=0 ;;
         q8)       KV=(-ctk q8_0 -ctv q8_0); run q8       GGML_CUDA_FA_Q8_WAVE=1 ;;
         q8-split) KV=(-ctk q8_0 -ctv q8_0); run q8-split GGML_CUDA_FA_Q8_WAVE=1 LLAMA_KV_SPLIT_HEADS=1 ;;
+        q8-b8)    KV=(-ctk q8_0 -ctv q8_0); NB=8 run q8-b8 GGML_CUDA_FA_Q8_WAVE=1 ;;
         *) echo "unknown variant ${V}" ;;
     esac
 done
