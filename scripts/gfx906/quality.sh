@@ -7,6 +7,7 @@
 # usage: scripts/gfx906/quality.sh [model.gguf] [build-dir]
 # env:   CTX=4096 CHUNKS=2 (tokens per chunk and number of chunks; one variant takes ~CTX*CHUNKS*10 ms)
 #        VARIANTS="f16 q8-plain q8-tile q8 q8-split" (subset to run)
+#        SANITY=1 (only the plain perplexity on the CPU vs the GPUs, see below)
 # variants: f16 KV | q8_0 KV without the fork kernels and fusions (conversion to f16, no fused Hadamard rotation) |
 #           q8_0 KV, FA tile kernel reading q8_0 | default (head 512 wave kernel) | default + LLAMA_KV_SPLIT_HEADS=1
 set -uo pipefail
@@ -30,6 +31,30 @@ if [ ! -f "${TEXT}" ]; then
     sh scripts/get-wikitext-2.sh || exit 1
 fi
 
+# all fork kernels and fusions off (as far as they can be switched off)
+PLAIN=(GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_FUSE_QKV=0 GGML_CUDA_FUSE_NORM_MULTI=0 GGML_CUDA_FUSE_GLU_Q8=0
+       GGML_CUDA_FUSE_FWHT=0 GGML_CUDA_FA_TILE_Q8=0 GGML_CUDA_FA_Q8_WAVE=0 GGML_CUDA_FA_COMBINE_SPLIT=0
+       GGML_CUDA_STAGED_COPY=0 GGML_SCHED_GPU_SPLIT_SYNC=1)
+
+# SANITY=1: plain perplexity of short chunks on the CPU (upstream code), on the GPUs with the fork changes off and on
+# the GPUs by default. If the GPU numbers differ from the CPU one, a GPU kernel is wrong.
+if [ -n "${SANITY:-}" ]; then
+    S=(-m "${MODEL}" -f "${TEXT}" -c 512 --chunks "${SANITY_CHUNKS:-8}" -ctk f16 -ctv f16)
+    ppl() {
+        local name=$1; shift
+        local log="${OUT}/sanity-${name}.log"
+        env "$@" > "${log}" 2>&1
+        printf '%-12s %s\n' "${name}" "$(grep -E 'Final estimate' "${log}" | sed -E 's/.*Final estimate: //')"
+    }
+    echo "=== sanity: perplexity, 512 tokens per chunk, f16 KV"
+    ppl cpu         "${BIN}/llama-perplexity" "${S[@]}" -ngl 0
+    ppl gpu-plain   "${PLAIN[@]}" "${BIN}/llama-perplexity" "${S[@]}" -ngl 99 -fa on -sm layer
+    ppl gpu-no-fa   "${PLAIN[@]}" "${BIN}/llama-perplexity" "${S[@]}" -ngl 99 -fa off -sm layer
+    ppl gpu         "${BIN}/llama-perplexity" "${S[@]}" -ngl 99 -fa on -sm layer
+    ppl gpu-1       "${BIN}/llama-perplexity" "${S[@]}" -ngl 99 -fa on -sm none
+    exit 0
+fi
+
 COMMON=(-m "${MODEL}" -f "${TEXT}" -c "${CTX}" --chunks "${CHUNKS}" -ngl 99 -fa on -sm layer)
 BASE="${OUT}/base-c${CTX}-n${CHUNKS}.kld"
 
@@ -48,7 +73,7 @@ run() {
     printf '%-9s PPL %s | KLD %s | same top %s | max KLD %s\n' "${name}" \
         "$(grep -m1 'Mean PPL(Q) ' "${log}" | sed -E 's/.*: +//')" \
         "$(grep -m1 'Mean    KLD' "${log}" | sed -E 's/.*KLD: +//')" \
-        "$(grep -m1 'Same top p' "${log}" | sed -E 's/.*: +//')" \
+        "$(grep -m1 'Same top p:' "${log}" | sed -E 's/.*: +//')" \
         "$(grep -m1 'Maximum KLD' "${log}" | sed -E 's/.*: +//')"
 }
 
@@ -56,7 +81,7 @@ echo "=== vs reference (CTX=${CTX}, CHUNKS=${CHUNKS}, one token per decode); low
 for V in ${VARIANTS}; do
     case ${V} in
         f16)      KV=(-ctk f16 -ctv f16);   run f16      GGML_CUDA_FA_Q8_WAVE=1 ;;
-        q8-plain) KV=(-ctk q8_0 -ctv q8_0); run q8-plain GGML_CUDA_FA_Q8_WAVE=0 GGML_CUDA_FA_TILE_Q8=0 GGML_CUDA_FUSE_FWHT=0 GGML_CUDA_DISABLE_FUSION=1 ;;
+        q8-plain) KV=(-ctk q8_0 -ctv q8_0); run q8-plain "${PLAIN[@]}" ;;
         q8-tile)  KV=(-ctk q8_0 -ctv q8_0); run q8-tile  GGML_CUDA_FA_Q8_WAVE=0 ;;
         q8)       KV=(-ctk q8_0 -ctv q8_0); run q8       GGML_CUDA_FA_Q8_WAVE=1 ;;
         q8-split) KV=(-ctk q8_0 -ctv q8_0); run q8-split GGML_CUDA_FA_Q8_WAVE=1 LLAMA_KV_SPLIT_HEADS=1 ;;
