@@ -5,6 +5,8 @@
 # env:   SEQ=<kernel name part> also prints the kernels around one call of that kernel (duration, idle gap before it)
 #        GAPS=1 prints the idle time of each GPU between kernels, by the kernel that follows the gap, and the time when
 #        no GPU runs a kernel (the real loss of a split over GPUs: copies through the host, syncs, launches)
+#        note: the kernel trace itself stalls the queues (wall ~36 ms/token traced vs ~9 ms untraced with 2 GPUs), so
+#        the gaps show where the runtime waits, not their untraced size; the kernel durations are fine
 import collections
 import csv
 import os
@@ -105,7 +107,7 @@ if os.environ.get("GAPS"):
         if int(r[c_end]) > end_max:
             end_max, last = int(r[c_end]), r
     tot = sum(g[0] for g in both.values())
-    print(f"\nno GPU busy: {tot/1e3/n_tok:.0f} us/token of wall {wall/1e3/n_tok:.0f} us/token")
+    print(f"\nno GPU busy: {tot/1e3/n_tok:.0f} us/token of wall {wall/1e3/n_tok:.0f} us/token (traced, see the note in prof-tg.py)")
     print(f"{'us/tok':>8} {'n/tok':>6} {'avg us':>7} {'max us':>7}  last kernel before -> first kernel after (agent:)")
     for (a, b), (ns, n, mx) in sorted(both.items(), key=lambda kv: -kv[1][0])[:15]:
         print(f"{ns/1e3/n_tok:8.1f} {n/n_tok:6.1f} {ns/1e3/n:7.2f} {mx/1e3:7.2f}  {a} -> {b}")
