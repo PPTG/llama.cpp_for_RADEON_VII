@@ -238,7 +238,9 @@ llama_kv_cache::llama_kv_cache(
         }();
         ggml_backend_dev_t dev_other = nullptr;
         uint32_t n_head_split = 0;
-        if (split_heads_env && offload && !v_trans && n_stream == 1 && has_v && !hparams.is_swa(il)) {
+        // not with -sm tensor: the KV heads are split over the GPUs there already
+        if (split_heads_env && offload && !v_trans && n_stream == 1 && has_v && !hparams.is_swa(il) &&
+                model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
             const uint32_t n_head_kv = hparams.n_head_kv(il);
             if (n_head_kv >= 2 && n_head_kv % 2 == 0 &&
                     n_embd_k_gqa == hparams.n_embd_head_k(il)*n_head_kv && n_embd_v_gqa == hparams.n_embd_head_v(il)*n_head_kv) {

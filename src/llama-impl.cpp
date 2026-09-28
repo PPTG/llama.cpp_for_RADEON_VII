@@ -69,10 +69,13 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 }
 
 void llama_clear_tensor_data(ggml_tensor * t, size_t offset, size_t size) {
-    static const std::vector<uint8_t> zeros(1024*1024, 0);
-
     // not all backend buffers implement ggml_backend_tensor_memset(), so write zeros instead
     // TODO: make this a generic fallback in `ggml_backend_tensor_memset` when `set_tensor` is available
+    // pieces of whole rows: a buffer split over several devices (-sm tensor) only takes writes of whole rows
+    const size_t row   = ggml_row_size(t->type, t->ne[0]);
+    const size_t chunk = row > 0 && size % row == 0 && offset % row == 0 ? std::max<size_t>(1, (1024*1024)/row)*row : 1024*1024;
+    std::vector<uint8_t> zeros(std::min(chunk, size), 0);
+
     for (size_t ofs = 0; ofs < size; ofs += zeros.size()) {
         ggml_backend_tensor_set(t, zeros.data(), offset + ofs, std::min(size - ofs, zeros.size()));
     }
