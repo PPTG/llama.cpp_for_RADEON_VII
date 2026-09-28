@@ -400,6 +400,63 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_q8_config(con
     return 0;
 }
 
+// Prompt processing variants of the f16 tile kernel for head size 512 (GQA 8) and 256 (GQA 2), the shapes of Gemma 4
+// (GGML_CUDA_FA_PP_CFG / GGML_CUDA_FA_PP_CFG_256 = 11..17, scripts/gfx906/tune-fa-pp.sh): Q columns per block and the
+// packed config. cfg ids >= 10 so that they do not collide with the q8_0 variants.
+static constexpr __host__ __device__ int ggml_cuda_fattn_tile_pp_cols(const int DKQ, const int cfg) {
+    if (DKQ == 512) { // 64 columns do not fit into 64 KB of LDS with head size 512
+        switch (cfg) {
+            case 11: case 14:          return 32;
+            case 15: case 16: case 17: return 16;
+            default:                   return 0;
+        }
+    }
+    if (DKQ == 256) {
+        switch (cfg) {
+            case 11: case 12: case 13: return 32;
+            case 15: case 16:          return 64;
+            default:                   return 0;
+        }
+    }
+    return 0;
+}
+
+static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_pp_config(const int DKQ, const int cfg) {
+    if (DKQ == 512) {
+        switch (cfg) {
+            case 11: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2,  64,  64);
+            case 14: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 1, 128,  64); // 12, 13 (512 threads, 64 / 32 KV rows) spilled
+            case 15: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2, 128,  64);
+            case 16: return GGML_CUDA_FATTN_TILE_Q8_CFG(512, 1, 128,  64);
+            case 17: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2,  64,  64);
+            default: return 0;
+        }
+    }
+    if (DKQ == 256) {
+        switch (cfg) {
+            case 11: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2,  64, 128);
+            case 12: return GGML_CUDA_FATTN_TILE_Q8_CFG(512, 1,  64, 128);
+            case 13: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2,  32,  64);
+            case 15: return GGML_CUDA_FATTN_TILE_Q8_CFG(256, 2,  32, 128);
+            case 16: return GGML_CUDA_FATTN_TILE_Q8_CFG(512, 1,  64, 128);
+            default: return 0;
+        }
+    }
+    return 0;
+}
+
+static int ggml_cuda_fattn_tile_pp_cfg_env(const int DKQ) {
+    static const int cfg_512 = [] {
+        const char * env = getenv("GGML_CUDA_FA_PP_CFG");
+        return env == nullptr ? 0 : atoi(env);
+    }();
+    static const int cfg_256 = [] {
+        const char * env = getenv("GGML_CUDA_FA_PP_CFG_256");
+        return env == nullptr ? 0 : atoi(env);
+    }();
+    return DKQ == 512 ? cfg_512 : DKQ == 256 ? cfg_256 : 0;
+}
+
 // variant that is actually used: cfg if it is defined for this shape, else 0
 // cfg >= 100: the same variant without the prefetch of the next K/V chunk (GGML_CUDA_FA_Q8_PIPE=0)
 static constexpr __host__ __device__ int ggml_cuda_fattn_tile_q8_cfg_eff(const int DKQ, const int ncols, const int cfg) {
@@ -407,11 +464,13 @@ static constexpr __host__ __device__ int ggml_cuda_fattn_tile_q8_cfg_eff(const i
 }
 
 static constexpr __device__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols, const int cfg, int) {
-    return cfg % 100 != 0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg % 100) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols);
+    return cfg % 100 >= 10 ? ggml_cuda_fattn_tile_pp_config(DKQ, cfg % 100) :
+           cfg % 100 !=  0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg % 100) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols);
 }
 
 static __host__ uint32_t ggml_cuda_fattn_tile_get_config_cfg(const int DKQ, const int DV, const int ncols, const int cfg, const int cc) {
-    return cfg % 100 != 0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg % 100) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols, cc);
+    return cfg % 100 >= 10 ? ggml_cuda_fattn_tile_pp_config(DKQ, cfg % 100) :
+           cfg % 100 !=  0 ? ggml_cuda_fattn_tile_q8_config(DKQ, ncols, cfg % 100) : ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols, cc);
 }
 
 // variant from GGML_CUDA_FA_Q8_CFG, else the fastest on gfx906 (fa-q8-cfg.sh): occupancy 3 for head 512; for head 256
@@ -1540,6 +1599,44 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     }
 
 #ifdef GGML_USE_HIP
+    // prompt processing variants for the Gemma 4 shapes (GGML_CUDA_FA_PP_CFG, GGML_CUDA_FA_PP_CFG_256)
+    if constexpr (!use_logit_softcap && DKQ == DV && ((DKQ == 512 && ncols2 == 8) || (DKQ == 256 && ncols2 == 2))) {
+        auto launch_pp = [&](auto cfg_c) -> bool {
+            constexpr int cfg            = decltype(cfg_c)::value;
+            constexpr int cols_per_block = ggml_cuda_fattn_tile_pp_cols(DKQ, cfg);
+            if constexpr (cols_per_block == 0) {
+                return false;
+            } else {
+                if (Q->ne[1] <= (cols_per_block/2)/ncols2) {
+                    return false; // too few Q columns for this block size
+                }
+                const uint32_t config = ggml_cuda_fattn_tile_get_config_cfg(DKQ, DV, cols_per_block, cfg, cc);
+                const int nwarps    = ((config >>  0) & ((1 << 10) - 1)) / warp_size;
+                const int nbatch_fa =  (config >> 14) & ((1 <<  9) - 1);
+                fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, GGML_TYPE_F16, cfg>;
+                launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                    (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, false, warp_size);
+                return true;
+            }
+        };
+        if (Q->ne[1] > 16/ncols2) {
+            bool done = false;
+            switch (ggml_cuda_fattn_tile_pp_cfg_env(DKQ)) {
+                case 11: done = launch_pp(std::integral_constant<int, 11>{}); break;
+                case 12: done = launch_pp(std::integral_constant<int, 12>{}); break;
+                case 13: done = launch_pp(std::integral_constant<int, 13>{}); break;
+                case 14: done = launch_pp(std::integral_constant<int, 14>{}); break;
+                case 15: done = launch_pp(std::integral_constant<int, 15>{}); break;
+                case 16: done = launch_pp(std::integral_constant<int, 16>{}); break;
+                case 17: done = launch_pp(std::integral_constant<int, 17>{}); break;
+                default: break;
+            }
+            if (done) {
+                return;
+            }
+        }
+    }
+
     if constexpr (DKQ <= 128) {
         if (Q->ne[1] > 32/ncols2) {
             constexpr int cols_per_block = 64;

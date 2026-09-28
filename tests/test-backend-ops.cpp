@@ -11443,6 +11443,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Gemma 4 prompt processing shapes (HIP GGML_CUDA_FA_PP_CFG variants): odd KV and Q lengths, q8_0 and f16
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int nb : { 13, 64, 200 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 1100, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, t, t, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {2, 1}, 1100, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, t, t, {0, 2, 1, 3}));
+        }
+    }
+
     // head size 512, GQA 8, q8_0 token generation (HIP flash_attn_q8_wave): sinks, softcap, model KV layout,
     // 2 sequences, GQA 16, 1 KV head (LLAMA_KV_SPLIT_HEADS)
     for (int kv : { 256, 1280 }) {
@@ -11848,6 +11856,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, true,  1408, n, 2816));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2816, n, 704));
     }
+
+    // prompt processing attention of Gemma 4 26B A4B (ubatch 1024, q8_0 KV cache, model layout), used to tune the FA tile
+    // kernel (GGML_CUDA_FA_PP_CFG): global layers with 1 KV head per GPU (LLAMA_KV_SPLIT_HEADS), SWA layers
+    for (int kv : { 8192, 32768 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 2048, 1024, true, false, 0, 0, GGML_PREC_F32,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
 
     // token generation attention of Gemma 4 26B A4B: SWA layers (head 256, 8 KV heads, GQA 2, window 1024 + ubatch)
     // and global layers (head 512, 2 KV heads, GQA 8) at long context
