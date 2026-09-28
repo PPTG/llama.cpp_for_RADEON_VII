@@ -208,11 +208,16 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         // this is to mirror Gemma4Attention in pytorch code
         ggml_tensor * qkv_fused = nullptr;
         ggml_tensor * Qcur;
+        // Q, K or V columns of the fused projection; one token: the view is contiguous already, no copy
+        auto qkv_slice = [&](int64_t dim, size_t offset) {
+            ggml_tensor * t = ggml_view_2d(ctx0, qkv_fused, dim, n_tokens, qkv_fused->nb[1], offset);
+            return n_tokens == 1 ? t : ggml_cont(ctx0, t);
+        };
         if (model.layers[il].wqkv) {
             qkv_fused = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
             cb(qkv_fused, "wqkv", il);
             const int64_t q_dim = n_embd_head * n_head;
-            Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_tokens, qkv_fused->nb[1], 0));
+            Qcur = qkv_slice(q_dim, 0);
         } else {
             Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
         }
@@ -238,8 +243,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                 const int64_t k_dim = n_embd_head * n_head_kv;
                 const int64_t v_dim = n_embd_head * n_head_kv;
                 const size_t  esize = ggml_element_size(qkv_fused);
-                Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, k_dim, n_tokens, qkv_fused->nb[1], q_dim * esize));
-                Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, v_dim, n_tokens, qkv_fused->nb[1], (q_dim + k_dim) * esize));
+                Kcur = qkv_slice(k_dim, q_dim * esize);
+                Vcur = qkv_slice(v_dim, (q_dim + k_dim) * esize);
             } else {
                 Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
                 Vcur = model.layers[il].wv
