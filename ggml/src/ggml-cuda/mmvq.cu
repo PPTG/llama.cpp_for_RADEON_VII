@@ -1287,7 +1287,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     return v >= -1 && v <= MMVQ_N_VARIANTS ? v : -1;
                 }();
                 // unset: tuned default on GCN, upstream heuristics elsewhere; 0: always upstream heuristics
-                const int variant = variant_env >= 0 ? variant_env : (GGML_CUDA_CC_IS_GCN(cc) ? MMVQ_GCN_DEFAULT_VARIANT : 0);
+                // q8_0 experts (MUL_MAT_ID): 2 warps x 4 rows, gfx906 Gemma 4 gate_up 1408x2816 55 -> 51 us
+                const int variant_gcn = type == GGML_TYPE_Q8_0 && ids != nullptr ? 10 : MMVQ_GCN_DEFAULT_VARIANT;
+                const int variant = variant_env >= 0 ? variant_env : (GGML_CUDA_CC_IS_GCN(cc) ? variant_gcn : 0);
                 if (variant > 0 && nrows_x % mmvq_variant_rows(variant) == 0) {
                     const auto launch_variant = [&](auto variant_tag) {
                         constexpr int c_variant = decltype(variant_tag)::value;

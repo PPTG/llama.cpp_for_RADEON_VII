@@ -11844,10 +11844,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_Q6_K }) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
                 {4096, 2816}, {2048, 2816}, {8192, 2816}, {2816, 4096}, {2816, 8192}, {2112, 2816}, {2816, 2112}, {262144, 2816}}) {
-            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+            if (k % ggml_blck_size(type) == 0) { // K-quants: K = 2112 is not a multiple of 256
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+            }
         }
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 8, true,  1408, 1, 2816));
-        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 8, false, 2816, 1, 704));
+        if (704 % ggml_blck_size(type) == 0) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 8, false, 2816, 1, 704));
+        }
     }
 
     // prompt processing shapes of Gemma 4 26B A4B (ubatch 512 / 1024), used to tune MMQ per shape
