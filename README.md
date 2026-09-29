@@ -32,7 +32,8 @@ Details, per-change measurements and the history are in [docs/gfx906.md](docs/gf
 
 ## Build
 
-Requirements: ROCm (tested with 7.1), a gfx906 GPU.
+Requirements: ROCm (tested with 7.1 and 7.2.1), a gfx906 GPU. ROCm 7.x needs the gfx906 files of rocBLAS from ROCm
+6.3.3: see [Installing ROCm 7.x on gfx906](docs/gfx906.md#installing-rocm-7x-on-gfx906).
 
 ```bash
 scripts/gfx906/build.sh                      # -> build-gfx906/
