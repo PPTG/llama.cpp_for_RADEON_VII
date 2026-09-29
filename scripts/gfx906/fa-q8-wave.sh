@@ -9,8 +9,8 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../.."
 
-BIN=${1:-build-dpp}/bin
-MODEL=${2:-models/gemma-4-26B-A4B-it-qat-uncensored-heretic-UDmerge-Q4_K_XL.gguf}
+BIN=${1:-build-gfx906}/bin
+MODEL=${2:-${MODEL:-models/gemma-4-26B-A4B-it-Q4_0.gguf}}
 DEPTHS=${DEPTHS:-"0,15000,32768"}
 PROMPT="Explain in a few sentences how a GPU executes a matrix multiplication."
 

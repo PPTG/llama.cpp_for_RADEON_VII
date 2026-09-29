@@ -16,8 +16,8 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../.."
 
-MODEL=${1:-models/gemma-4-26B-A4B-it-qat-uncensored-heretic-UDmerge-Q4_K_XL.gguf}
-BUILD_DIR=${2:-build-dpp}
+MODEL=${1:-${MODEL:-models/gemma-4-26B-A4B-it-Q4_0.gguf}}
+BUILD_DIR=${2:-build-gfx906}
 BIN=${BUILD_DIR}/bin
 CTX=${CTX:-4096}
 CHUNKS=${CHUNKS:-2}

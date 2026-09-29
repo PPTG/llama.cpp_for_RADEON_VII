@@ -7,7 +7,7 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../.."
 
-BIN=${1:-build-dpp}/bin
+BIN=${1:-build-gfx906}/bin
 
 run() {
     echo "=== ${1}"

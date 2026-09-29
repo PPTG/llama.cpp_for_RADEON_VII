@@ -9,8 +9,8 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../.."
 
-MODEL=${1:-models/gemma-4-26B-A4B-it-qat-uncensored-heretic-UDmerge-Q4_K_XL.gguf}
-BIN=${2:-build-dpp}/bin
+MODEL=${1:-${MODEL:-models/gemma-4-26B-A4B-it-Q4_0.gguf}}
+BIN=${2:-build-gfx906}/bin
 CFG512=${CFG512:-"0 11 14 15 16 17"}
 CFG256=${CFG256:-"0 11 12 13 15 16"}
 BENCH=${BENCH:-1}

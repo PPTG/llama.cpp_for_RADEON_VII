@@ -7,7 +7,7 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../.."
 
-BIN=${1:-build-dpp}/bin
+BIN=${1:-build-gfx906}/bin
 VARIANTS=${VARIANTS:-"0 1 2 3 4 5 6 7 8 10 11"}
 TMP=$(mktemp -d)
 

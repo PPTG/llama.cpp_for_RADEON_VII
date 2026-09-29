@@ -15,7 +15,7 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../.."
 
-MODEL=${1:-models/gemma-4-26B-A4B-it-qat-uncensored-heretic-UDmerge-Q4_K_XL.gguf}
+MODEL=${1:-${MODEL:-models/gemma-4-26B-A4B-it-Q4_0.gguf}}
 VARIANTS=${VARIANTS:-"nodpp dpp nw1 nw4"}
 ROCM_PATH=${ROCM_PATH:-/opt/rocm}
 export PATH="${ROCM_PATH}/bin:${PATH}"

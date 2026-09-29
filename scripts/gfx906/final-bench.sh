@@ -7,9 +7,9 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../.."
 
-MODEL=${1:-models/gemma-4-26B-A4B-it-qat-uncensored-heretic-UDmerge-Q4_K_XL.gguf}
+MODEL=${1:-${MODEL:-models/gemma-4-26B-A4B-it-Q4_0.gguf}}
 UPSTREAM=${2:-build-nodpp}
-FORK=${3:-build-dpp}
+FORK=${3:-build-gfx906}
 OUT=results-gfx906/final-$(date +%Y%m%d-%H%M%S).md
 mkdir -p results-gfx906
 

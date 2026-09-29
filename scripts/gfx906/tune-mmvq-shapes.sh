@@ -8,7 +8,7 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../.."
 
-BIN=${1:-build-dpp}/bin
+BIN=${1:-build-gfx906}/bin
 VARIANTS=${VARIANTS:-"1 2 3 4 5 6 7 8 9 10 11"}
 TYPE=${TYPE:-q4_0} # q4_0, q8_0, q4_K, q5_1, q6_K (perf cases in test-backend-ops)
 

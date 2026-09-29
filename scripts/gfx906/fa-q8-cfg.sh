@@ -8,7 +8,7 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../.."
 
-BIN=${1:-build-dpp}/bin
+BIN=${1:-build-gfx906}/bin
 
 for RUN in "0 1" "2 1" "3 1" "0 0" "2 0" "3 0"; do
     set -- ${RUN}
