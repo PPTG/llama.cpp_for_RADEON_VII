@@ -3,16 +3,18 @@
 # us per call for every variant, to pick the variant per shape (e.g. the short rows of the MoE down experts, K = 704).
 #
 # usage: scripts/gfx906/tune-mmvq-shapes.sh [build-dir]
+# env:   TYPE=q4_0 (weight type: q4_0, q8_0, q4_K, q5_1, q6_K), VARIANTS
 set -uo pipefail
 
 cd "$(dirname "$0")/../.."
 
 BIN=${1:-build-dpp}/bin
 VARIANTS=${VARIANTS:-"1 2 3 4 5 6 7 8 9 10 11"}
+TYPE=${TYPE:-q4_0} # q4_0, q8_0, q4_K, q5_1, q6_K (perf cases in test-backend-ops)
 
 # gemma 4: attention / shared MLP (dense, K = 2816 / 2112 / 4096) and the experts (8 of 128, K = 2816 and 704)
-FILTER_MM="type_a=q4_0,type_b=f32,m=(4096|2048|2112|2816),n=1,k=(2816|2112|4096),bs"
-FILTER_ID="type_a=q4_0,type_b=f32,n_mats=128,n_used=8,b=.,m=(1408|2816),n=1,k=(2816|704)"
+FILTER_MM="type_a=${TYPE},type_b=f32,m=(4096|2048|2112|2816),n=1,k=(2816|2112|4096),bs"
+FILTER_ID="type_a=${TYPE},type_b=f32,n_mats=128,n_used=8,b=.,m=(1408|2816),n=1,k=(2816|704)"
 
 run() {
     local v=$1

@@ -11839,13 +11839,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    // token generation shapes of Gemma 4 26B A4B (n_embd 2816), used to tune MMVQ per shape
-    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
-            {4096, 2816}, {2048, 2816}, {8192, 2816}, {2816, 4096}, {2816, 8192}, {2112, 2816}, {2816, 2112}, {262144, 2816}}) {
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+    // token generation shapes of Gemma 4 26B A4B (n_embd 2816), used to tune MMVQ per shape; q4_0 (Q4_0 quants), q8_0,
+    // q4_K, q5_1, q6_K (Unsloth UD-Q4_K_M keeps many tensors in q8_0)
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_Q6_K }) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                {4096, 2816}, {2048, 2816}, {8192, 2816}, {2816, 4096}, {2816, 8192}, {2112, 2816}, {2816, 2112}, {262144, 2816}}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 8, true,  1408, 1, 2816));
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 8, false, 2816, 1, 704));
     }
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, true,  1408, 1, 2816));
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2816, 1, 704));
 
     // prompt processing shapes of Gemma 4 26B A4B (ubatch 512 / 1024), used to tune MMQ per shape
     for (int64_t n : { 512, 1024 }) {
