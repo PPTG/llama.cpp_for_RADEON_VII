@@ -1491,7 +1491,11 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    // MUL_MAT_ID on GCN: tiles up to 64 columns (gfx906, q8_0 Gemma 4 experts: -34% at ubatch 512, -5..8% at 1024
+    // vs up to 128); dense matmuls keep up to 128
+    const int J_max = GGML_CUDA_CC_IS_GCN(cc) && args.expert_bounds != nullptr ? 64 : 128;
+
+    for (int J = 8; J <= J_max && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
