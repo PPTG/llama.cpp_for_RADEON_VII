@@ -11854,14 +11854,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // prompt processing shapes of Gemma 4 26B A4B (ubatch 512 / 1024), used to tune MMQ per shape
-    for (int64_t n : { 512, 1024 }) {
-        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
-                {4096, 2816}, {2048, 2816}, {2816, 4096}, {2112, 2816}, {2816, 2112}}) {
-            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+    // prompt processing shapes of Gemma 4 26B A4B (ubatch 512 / 1024), used to tune MMQ per shape (q4_0, q8_0)
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+        for (int64_t n : { 512, 1024 }) {
+            for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{
+                    {4096, 2816}, {2048, 2816}, {2816, 4096}, {2112, 2816}, {2816, 2112}}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 8, true,  1408, n, 2816));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 128, 8, false, 2816, n, 704));
         }
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, true,  1408, n, 2816));
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2816, n, 704));
     }
 
     // prompt processing attention of Gemma 4 26B A4B (ubatch 1024, q8_0 KV cache, model layout), used to tune the FA tile
