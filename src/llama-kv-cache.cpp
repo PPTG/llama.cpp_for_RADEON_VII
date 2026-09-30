@@ -244,7 +244,18 @@ llama_kv_cache::llama_kv_cache(
             const uint32_t n_head_kv = hparams.n_head_kv(il);
             if (n_head_kv >= 2 && n_head_kv % 2 == 0 &&
                     n_embd_k_gqa == hparams.n_embd_head_k(il)*n_head_kv && n_embd_v_gqa == hparams.n_embd_head_v(il)*n_head_kv) {
-                for (const auto & d : model.devices) {
+                // the next GPU after the one of the layer (cyclic): with 3+ GPUs every GPU takes the heads of one
+                // neighbour instead of the first GPU taking those of all others
+                const size_t n_dev = model.devices.size();
+                size_t i_layer = 0;
+                for (size_t i = 0; i < n_dev; ++i) {
+                    if (model.devices[i].dev == model.dev_layer(il)) {
+                        i_layer = i;
+                        break;
+                    }
+                }
+                for (size_t j = 1; j < n_dev; ++j) {
+                    const auto & d = model.devices[(i_layer + j) % n_dev];
                     if (!d.is_meta && d.dev != model.dev_layer(il) && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                         dev_other = d.dev;
                         break;
