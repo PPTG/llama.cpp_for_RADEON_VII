@@ -5,6 +5,9 @@
 # repeated 3+ times, or one line of 16+ characters repeated 4+ times in a row.
 #
 # usage: scripts/gfx906/loop-test.py <model.gguf> [--build build-gfx906] [--seeds 5] [--tokens 1500] [--configs a,b]
+#                                    [--temp 1.0] [--fill 30000]
+# --temp 0 tests greedy decoding (agents often send a low temperature for tool calls), --fill N puts ~N tokens of
+# documentation in front of every prompt (long context: FA on a long KV cache, split heads, quantized KV).
 import argparse
 import json
 import os
@@ -92,16 +95,27 @@ def main():
     ap.add_argument("--tokens", type=int, default=1500)
     ap.add_argument("--ctx", type=int, default=16384)
     ap.add_argument("--configs", default=",".join(CONFIGS))
+    ap.add_argument("--temp", type=float, default=1.0)
+    ap.add_argument("--fill", type=int, default=0, help="tokens of documentation in front of every prompt")
     args = ap.parse_args()
 
     out_dir = "results-gfx906/loop-test"
     os.makedirs(out_dir, exist_ok=True)
+
+    fill = ""
+    if args.fill > 0:
+        import glob
+        docs = "\n\n".join(open(f, errors="ignore").read() for f in sorted(glob.glob("docs/**/*.md", recursive=True)))
+        while len(fill) < args.fill * 4: # ~4 characters per token
+            fill += docs
+        fill = "Reference material:\n\n" + fill[:args.fill * 4] + "\n\nEnd of the reference material.\n\n"
+        args.ctx = max(args.ctx, args.fill + args.tokens + 4096)
     summary = []
     for name in args.configs.split(","):
         env_add, srv_args = CONFIGS[name]
         env = dict(os.environ, **env_add)
         cmd = [f"{args.build}/bin/llama-server", "-m", args.model, "-ngl", "99", "-sm", "layer", "-fa", "on",
-               "-c", str(args.ctx), "-np", "1", "--port", str(args.port)] + srv_args
+               "-c", str(args.ctx), "-np", "1", "-ub", "1024", "--port", str(args.port)] + srv_args
         log = open(f"{out_dir}/server-{name}.log", "w")
         proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
         try:
@@ -112,9 +126,9 @@ def main():
             per_prompt = {}
             for kind, prompt in PROMPTS:
                 for seed in range(args.seeds):
-                    body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": args.tokens,
-                            "temperature": 1.0, "top_k": 64, "top_p": 0.95, "min_p": 0.0, "seed": 1000 + seed,
-                            "cache_prompt": False}
+                    body = {"messages": [{"role": "user", "content": fill + prompt}], "max_tokens": args.tokens,
+                            "temperature": args.temp, "top_k": 64, "top_p": 0.95, "min_p": 0.0, "seed": 1000 + seed,
+                            "cache_prompt": args.fill > 0}
                     try:
                         res = post(args.port, body)
                     except Exception as e:
@@ -128,10 +142,11 @@ def main():
                     per_prompt[kind][0] += loop
                     per_prompt[kind][1] += 1
                     tps.append(res.get("timings", {}).get("predicted_per_second", 0.0))
-                    with open(f"{out_dir}/{name}-{kind}-{seed}{'-LOOP' if loop else ''}.txt", "w") as f:
+                    tag = f"t{args.temp:g}-f{args.fill}"
+                    with open(f"{out_dir}/{name}-{tag}-{kind}-{seed}{'-LOOP' if loop else ''}.txt", "w") as f:
                         f.write(text)
             detail = " ".join(f"{k} {v[0]}/{v[1]}" for k, v in per_prompt.items())
-            line = f"{name:9s} loops {loops}/{total}   ({detail})   {sum(tps) / max(len(tps), 1):.1f} t/s"
+            line = f"{name:9s} temp {args.temp:g} fill {args.fill}  loops {loops}/{total}   ({detail})   {sum(tps) / max(len(tps), 1):.1f} t/s"
             print(line, flush=True)
             summary.append(line)
         finally:
