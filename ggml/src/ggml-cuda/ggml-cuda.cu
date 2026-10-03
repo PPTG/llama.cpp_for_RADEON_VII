@@ -3771,18 +3771,11 @@ static bool ggml_cuda_fuse_glu_q8_enabled() {
 }
 
 // GGML_CUDA_FUSE_ROUTER_TOPK=0/1: the MoE router mul_mat (F32) of one token and the softmax top-k after it run as one
-// kernel. Default on for HIP.
+// kernel. Default off: no gain on gfx906 (Gemma 4 26B A4B tg32 107.5 vs 107.6 t/s).
 static bool ggml_cuda_fuse_router_topk_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_FUSE_ROUTER_TOPK");
-        if (env != nullptr) {
-            return atoi(env) != 0;
-        }
-#ifdef GGML_USE_HIP
-        return true;
-#else
-        return false;
-#endif // GGML_USE_HIP
+        return env != nullptr && atoi(env) != 0;
     }();
     return enabled;
 }
