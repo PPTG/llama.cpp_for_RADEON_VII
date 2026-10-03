@@ -129,6 +129,11 @@ if (NOT GGML_CUDA_FA)
     add_compile_definitions(GGML_CUDA_NO_FA)
 endif()
 
+# AMDGPU scheduler favoring instruction level parallelism over occupancy (needs an LLVM with -amdgpu-sched-strategy)
+if (GGML_HIP_MAX_ILP)
+    target_compile_options(ggml-hip PRIVATE "SHELL:-mllvm -amdgpu-sched-strategy=max-ilp")
+endif()
+
 if (CXX_IS_HIPCC)
     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE CXX)
     if (WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Debug")
