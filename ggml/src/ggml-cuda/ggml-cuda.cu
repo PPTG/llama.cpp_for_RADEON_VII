@@ -737,6 +737,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(mmvq_q8_cache.buf));
     }
+    for (ggml_cuda_q8_pre_slot & slot : q8_pre.slots) {
+        if (slot.buf != nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(slot.buf));
+        }
+    }
     for (ggml_cuda_staged_copy_slot & slot : staged_copy_slots) {
         if (slot.h2d_done != nullptr) {
             CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
@@ -3760,6 +3766,43 @@ static bool ggml_cuda_fuse_glu_q8_enabled() {
     return enabled;
 }
 
+// GGML_CUDA_FUSE_NORM_Q8=0/1: rms_norm -> mul whose result feeds a MMVQ mul_mat also writes the q8_1 copy for it
+// (the separate quantize_q8_1 is skipped, same q8_1 data). Default on for HIP.
+static bool ggml_cuda_fuse_norm_q8_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_NORM_Q8");
+        if (env != nullptr) {
+            return atoi(env) != 0;
+        }
+#ifdef GGML_USE_HIP
+        return true;
+#else
+        return false;
+#endif // GGML_USE_HIP
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor);
+
+// Buffer for the q8_1 copy of t if one of the next nodes multiplies t (or a view of all of t) by a quantized matrix
+// with MMVQ, else nullptr
+static void * ggml_cuda_norm_q8_buffer(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i,
+                                       const ggml_tensor * t) {
+    if (!ggml_cuda_fuse_norm_q8_enabled() || ggml_nrows(t) > MMVQ_MAX_BATCH_SIZE) {
+        return nullptr;
+    }
+    const int end = std::min(cgraph->n_nodes, i + 64);
+    for (int j = i + 1; j < end; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1] != nullptr &&
+                (node->src[1] == t || node->src[1]->view_src == t) && ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
+            return ggml_cuda_q8_pre_alloc(ctx, t);
+        }
+    }
+    return nullptr;
+}
+
 // GGML_CUDA_FUSE_NORM_MULTI=0/1: several rms_norm -> [scale ->] mul chains on the same input (e.g. the 3 norms of
 // attn_out in Gemma 4) run as one kernel, graph_optimize moves them next to each other. Default on for HIP.
 static bool ggml_cuda_fuse_norm_multi_enabled() {
@@ -4762,7 +4805,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             pos += len;
         }
         if (n >= 2) {
-            ggml_cuda_op_rms_norm_multi(*cuda_ctx, norms, scales, muls, n);
+            void * q8[3] = {};
+            for (int k = 0; k < n; ++k) {
+                q8[k] = ggml_cuda_norm_q8_buffer(*cuda_ctx, cgraph, pos - 1, muls[k]);
+            }
+            ggml_cuda_op_rms_norm_multi(*cuda_ctx, norms, scales, muls, n, q8);
             return pos - i - 1;
         }
     }
@@ -4808,7 +4855,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        if (ggml_cuda_rms_norm_mul_q8_1_supported(node, mul)) {
+            if (void * q8 = ggml_cuda_norm_q8_buffer(*cuda_ctx, cgraph, i + 1, mul)) {
+                ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, node, mul, q8);
+                return 1;
+            }
+        }
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, mul);
         return 1;
     }
 
@@ -5094,6 +5148,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     // tensor data may change between graph computes
     cuda_ctx->mmvq_q8_cache.reset();
+    cuda_ctx->q8_pre.reset();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

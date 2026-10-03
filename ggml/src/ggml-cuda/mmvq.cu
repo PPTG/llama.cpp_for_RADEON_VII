@@ -1557,6 +1557,48 @@ static bool ggml_cuda_mmvq_use_q8_cache() {
     return use;
 }
 
+void * ggml_cuda_q8_pre_alloc(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->view_src != nullptr) {
+        return nullptr;
+    }
+    cudaStream_t stream = ctx.stream();
+    const size_t size = ggml_nrows(t) * GGML_PAD(t->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1) / QK8_1;
+
+    ggml_cuda_q8_pre & pre = ctx.q8_pre;
+    ggml_cuda_q8_pre_slot & slot = pre.slots[pre.next];
+    if (slot.size < size) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+        if (capture_status != cudaStreamCaptureStatusNone) {
+            return nullptr;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (slot.buf != nullptr) {
+            CUDA_CHECK(cudaFree(slot.buf));
+        }
+        slot.size = std::max(size, (size_t) 64*1024);
+        CUDA_CHECK(cudaMalloc(&slot.buf, slot.size));
+    }
+    pre.next = (pre.next + 1) % ggml_cuda_q8_pre::n_slots;
+    slot.t      = t;
+    slot.stream = stream;
+    return slot.buf;
+}
+
+// q8_1 copy of src1 written by the kernel that computed it, or nullptr
+static const char * ggml_cuda_q8_pre_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1) {
+    const ggml_tensor * t = src1->view_src ? src1->view_src : src1;
+    if (src1->data != t->data || !ggml_is_contiguous(src1) || src1->ne[0] != t->ne[0] || ggml_nrows(src1) != ggml_nrows(t)) {
+        return nullptr;
+    }
+    for (const ggml_cuda_q8_pre_slot & slot : ctx.q8_pre.slots) {
+        if (slot.t == t && slot.stream == ctx.stream()) {
+            return (const char *) slot.buf;
+        }
+    }
+    return nullptr;
+}
+
 // Quantize src1 to Q8_1 for MMVQ, or reuse the Q8_1 data of the previous MMVQ in this graph compute if it had the same src1.
 // src1 is still used by the current op, so its data can not have been overwritten in between.
 static char * ggml_cuda_mmvq_quantize_src1(
@@ -1566,6 +1608,10 @@ static char * ggml_cuda_mmvq_quantize_src1(
     cudaStream_t stream = ctx.stream();
     const size_t ts_src1 = ggml_type_size(src1->type);
     const float * src1_d = (const float *) src1->data;
+
+    if (const char * pre = ggml_cuda_q8_pre_find(ctx, src1)) {
+        return (char *) pre;
+    }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;

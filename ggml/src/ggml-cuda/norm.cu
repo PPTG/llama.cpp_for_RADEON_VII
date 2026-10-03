@@ -795,12 +795,71 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 struct ggml_cuda_rms_norm_multi_args {
     const float * w[3]         = {nullptr, nullptr, nullptr};
     float *       dst[3]       = {nullptr, nullptr, nullptr};
+    void *        q8[3]        = {nullptr, nullptr, nullptr}; // optional q8_1 copies for MMVQ
     float         scale_out[3] = {1.0f, 1.0f, 1.0f};
     bool          has_scale[3] = {false, false, false};
     int           n            = 0;
+    int           ncols_q8     = 0; // padded row size of the q8_1 copies
 };
 
+// Quantize one value per thread to q8_1 like quantize_q8_1 (same reductions, same result). All threads of the warp
+// must call it; consecutive threads hold consecutive columns, col % QK8_1 == lane % QK8_1. Columns >= ncols_padded are
+// not stored.
+static __device__ __forceinline__ void rms_norm_store_q8_1(const float xi, void * vy, const int64_t row, const int col,
+                                                           const int ncols_padded) {
+    float amax = fabsf(xi);
+    float sum  = xi;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    if (col >= ncols_padded) {
+        return;
+    }
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    block_q8_1 * y = (block_q8_1 *) vy + row*(ncols_padded/QK8_1) + col/QK8_1;
+    y->qs[col % QK8_1] = q;
+    if (col % QK8_1 == 0) {
+        y->ds = make_half2(d, sum);
+    }
+}
+
+// rms_norm -> mul (weight row of ncols) that also writes the q8_1 copy of the result for MMVQ.
+// The norm and the product are computed as in rms_norm_f32<block_size, true>, so dst is the same.
 template <int block_size>
+static __global__ void rms_norm_mul_q8_1_f32(const float * x, const float * w, float * dst, void * q8, const int ncols,
+                                             const int64_t stride_row, const float eps, const int ncols_padded) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    x   += row*stride_row;
+    dst += (int64_t) row*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    // all threads run every step (uniform warp reductions), columns >= ncols are the zero padding
+    for (int col0 = 0; col0 < ncols_padded; col0 += block_size) {
+        const int col = col0 + tid;
+        float v = 0.0f;
+        if (col < ncols) {
+            v = scale * x[col] * w[col];
+            dst[col] = v;
+        }
+        rms_norm_store_q8_1(v, q8, row, col, ncols_padded);
+    }
+}
+
+template <int block_size, bool with_q8>
 static __global__ void rms_norm_multi_f32(const float * x, const int ncols, const int64_t stride_row, const float eps,
                                           const ggml_cuda_rms_norm_multi_args args) {
     const int row = blockIdx.x;
@@ -820,20 +879,42 @@ static __global__ void rms_norm_multi_f32(const float * x, const int ncols, cons
     const float mean  = tmp / ncols;
     const float scale = rsqrtf(mean + eps);
 
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
+    if constexpr (!with_q8) {
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[col];
 #pragma unroll
-        for (int k = 0; k < 3; ++k) {
-            if (k < args.n) {
-                const float v = args.has_scale[k] ? (args.scale_out[k] * (scale * xi)) * args.w[k][col] : scale * xi * args.w[k][col];
-                args.dst[k][(int64_t) row*ncols + col] = v;
+            for (int k = 0; k < 3; ++k) {
+                if (k < args.n) {
+                    const float v = args.has_scale[k] ? (args.scale_out[k] * (scale * xi)) * args.w[k][col] : scale * xi * args.w[k][col];
+                    args.dst[k][(int64_t) row*ncols + col] = v;
+                }
+            }
+        }
+    } else {
+        // all threads run every step (uniform warp reductions), columns >= ncols are the zero padding
+        for (int col0 = 0; col0 < args.ncols_q8; col0 += block_size) {
+            const int   col = col0 + tid;
+            const float xi  = col < ncols ? x[col] : 0.0f;
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                if (k < args.n) {
+                    float v = 0.0f;
+                    if (col < ncols) {
+                        v = args.has_scale[k] ? (args.scale_out[k] * (scale * xi)) * args.w[k][col] : scale * xi * args.w[k][col];
+                        args.dst[k][(int64_t) row*ncols + col] = v;
+                    }
+                    if (args.q8[k] != nullptr) {
+                        rms_norm_store_q8_1(v, args.q8[k], row, col, args.ncols_q8);
+                    }
+                }
             }
         }
     }
 }
 
 void ggml_cuda_op_rms_norm_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const * norms,
-                                 const ggml_tensor * const * scales, const ggml_tensor * const * muls, const int n) {
+                                 const ggml_tensor * const * scales, const ggml_tensor * const * muls, const int n,
+                                 void * const * q8) {
     GGML_ASSERT(n >= 1 && n <= 3);
     const ggml_tensor * src = norms[0]->src[0];
     GGML_ASSERT(src->type == GGML_TYPE_F32 && src->nb[0] == sizeof(float) && ggml_is_contiguous_rows(src));
@@ -853,7 +934,13 @@ void ggml_cuda_op_rms_norm_multi(ggml_backend_cuda_context & ctx, const ggml_ten
             args.has_scale[k] = true;
             memcpy(&args.scale_out[k], scales[k]->op_params, sizeof(float));
         }
+        if (q8 != nullptr && q8[k] != nullptr) {
+            GGML_ASSERT(ggml_is_contiguous(muls[k]));
+            args.q8[k] = q8[k];
+        }
     }
+    const bool with_q8 = args.q8[0] != nullptr || args.q8[1] != nullptr || args.q8[2] != nullptr;
+    args.ncols_q8 = GGML_PAD(src->ne[0], MATRIX_ROW_PADDING);
 
     const int     ncols      = src->ne[0];
     const int     nrows      = src->ne[1];
@@ -861,10 +948,55 @@ void ggml_cuda_op_rms_norm_multi(ggml_backend_cuda_context & ctx, const ggml_ten
     cudaStream_t  stream     = ctx.stream();
 
     // same block size as the single kernels, so the reduction order is the same
+    const float * x = (const float *) src->data;
     if (ggml_cuda_rms_norm_small_block(ncols)) {
-        rms_norm_multi_f32<256><<<nrows, 256, 32 * sizeof(float), stream>>>((const float *) src->data, ncols, stride_row, eps, args);
+        if (with_q8) {
+            rms_norm_multi_f32<256, true><<<nrows, 256, 32 * sizeof(float), stream>>>(x, ncols, stride_row, eps, args);
+        } else {
+            rms_norm_multi_f32<256, false><<<nrows, 256, 32 * sizeof(float), stream>>>(x, ncols, stride_row, eps, args);
+        }
     } else {
-        rms_norm_multi_f32<1024><<<nrows, 1024, 32 * sizeof(float), stream>>>((const float *) src->data, ncols, stride_row, eps, args);
+        if (with_q8) {
+            rms_norm_multi_f32<1024, true><<<nrows, 1024, 32 * sizeof(float), stream>>>(x, ncols, stride_row, eps, args);
+        } else {
+            rms_norm_multi_f32<1024, false><<<nrows, 1024, 32 * sizeof(float), stream>>>(x, ncols, stride_row, eps, args);
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_rms_norm_mul_q8_1_supported(const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    const ggml_tensor * src = rms_norm->src[0];
+    const ggml_tensor * w   = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    return src->type == GGML_TYPE_F32 && src->nb[0] == sizeof(float) && ggml_is_contiguous_rows(src) &&
+        src->ne[2] == 1 && src->ne[3] == 1 && src->ne[1] <= 65535 &&
+        w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == src->ne[0] && ggml_nrows(w) == 1 &&
+        mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) && ggml_are_same_shape(mul, src);
+}
+
+void ggml_cuda_op_rms_norm_mul_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul,
+                                    void * q8) {
+    GGML_ASSERT(ggml_cuda_rms_norm_mul_q8_1_supported(rms_norm, mul));
+    const ggml_tensor * src = rms_norm->src[0];
+    const ggml_tensor * w   = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const int     ncols        = src->ne[0];
+    const int     nrows        = src->ne[1];
+    const int64_t stride_row   = src->nb[1] / sizeof(float);
+    const int     ncols_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
+    cudaStream_t  stream       = ctx.stream();
+
+    const float * x   = (const float *) src->data;
+    const float * wd  = (const float *) w->data;
+    float *       dst = (float *) mul->data;
+    // same block size as rms_norm_f32, so the reduction order is the same
+    if (ggml_cuda_rms_norm_small_block(ncols)) {
+        rms_norm_mul_q8_1_f32<256><<<nrows, 256, 32 * sizeof(float), stream>>>(x, wd, dst, q8, ncols, stride_row, eps, ncols_padded);
+    } else {
+        rms_norm_mul_q8_1_f32<1024><<<nrows, 1024, 32 * sizeof(float), stream>>>(x, wd, dst, q8, ncols, stride_row, eps, ncols_padded);
     }
     CUDA_CHECK(cudaGetLastError());
 }

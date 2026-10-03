@@ -3912,6 +3912,76 @@ struct test_glu_mul_mat : public test_case {
     }
 };
 
+// rms_norm -> mul -> mul_mat(_id) (attn_norm -> Q/K, ffn_norm -> gate/up, MoE input), some backends write the q8_1
+// input of the mul_mat in the norm kernel. multi: two norm chains on the same input (one kernel), the second one feeds
+// a mul_mat_id.
+struct test_rms_norm_mul_mat : public test_case {
+    const ggml_type type;
+    const int64_t   n_embd;
+    const int64_t   n_out;
+    const int64_t   n_tokens;
+    const bool      multi;
+    static constexpr int n_mats = 16;
+    static constexpr int n_used = 4;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, n_embd, n_out, n_tokens, multi);
+    }
+
+    test_rms_norm_mul_mat(ggml_type type, int64_t n_embd, int64_t n_out, int64_t n_tokens, bool multi)
+        : type(type), n_embd(n_embd), n_out(n_out), n_tokens(n_tokens), multi(multi) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * x = ggml_add(ctx, a, c);
+        if (gf != nullptr) {
+            ggml_build_forward_expand(gf, x);
+        }
+        ggml_tensor * w0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_tensor * m0 = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w0);
+        if (gf != nullptr) {
+            ggml_build_forward_expand(gf, m0);
+        }
+        ggml_tensor * m1 = m0;
+        if (multi) {
+            ggml_tensor * w1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+            m1 = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w1);
+            if (gf != nullptr) {
+                ggml_build_forward_expand(gf, m1); // next to the first chain
+            }
+        }
+        ggml_tensor * out = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, n_embd, n_out), m0);
+        if (multi) {
+            ggml_tensor * we  = ggml_new_tensor_3d(ctx, type, n_embd, n_out, n_mats);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
+            ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+            ggml_tensor * e = ggml_mul_mat_id(ctx, we, ggml_reshape_3d(ctx, m1, n_embd, 1, n_tokens), ids);
+            out = ggml_concat(ctx, out, ggml_reshape_2d(ctx, e, n_out*n_used, n_tokens), 0);
+        } else {
+            // a second mul_mat with the same input (Q and K)
+            out = ggml_concat(ctx, out, ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, n_embd, n_out), m0), 0);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 // Hadamard rotation (mul_mat with GGML_HINT_SRC0_IS_HADAMARD) of K/V or of the attention output, followed by the
 // store into a quantized KV cache (set_rows) or by attn_output (mul_mat), fused into one kernel by some backends
 struct test_fwht_fused : public test_case {
@@ -10413,6 +10483,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_multi(type, 2816, { 4096, 2048, 2048 }));
         test_cases.emplace_back(new test_mul_mat_multi(type, 2816, { 2112, 2112, 0 }));
         test_cases.emplace_back(new test_mul_mat_multi(type, 256,  { 64, 128, 8 }));
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
+        for (bool multi : { false, true }) {
+            test_cases.emplace_back(new test_rms_norm_mul_mat(type, 2816, 512, 1, multi));
+            test_cases.emplace_back(new test_rms_norm_mul_mat(type, 2560, 256, 1, multi)); // row padding 2560 -> 2560
+            test_cases.emplace_back(new test_rms_norm_mul_mat(type,  768, 256, 1, multi)); // 256 thread block
+            test_cases.emplace_back(new test_rms_norm_mul_mat(type, 2816, 512, 3, multi));
+        }
     }
 
     for (int64_t n : { 64, 1536, 2816 }) {

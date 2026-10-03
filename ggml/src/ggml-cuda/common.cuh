@@ -1550,6 +1550,27 @@ struct ggml_cuda_mmvq_q8_cache {
     }
 };
 
+// Q8_1 copies of MMVQ inputs, written by the kernel that computes the input (rms_norm fusions) and used by MMVQ
+// instead of quantizing again. Only valid within one graph compute: reset at the start of each graph compute.
+struct ggml_cuda_q8_pre_slot {
+    const ggml_tensor * t      = nullptr;
+    cudaStream_t        stream = nullptr;
+    void *              buf    = nullptr;
+    size_t              size   = 0;
+};
+
+struct ggml_cuda_q8_pre {
+    static constexpr int n_slots = 4;
+    ggml_cuda_q8_pre_slot slots[n_slots];
+    int next = 0;
+
+    void reset() {
+        for (ggml_cuda_q8_pre_slot & s : slots) {
+            s.t = nullptr;
+        }
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1559,6 +1580,7 @@ struct ggml_backend_cuda_context {
     int staged_copy_next = 0;
 
     ggml_cuda_mmvq_q8_cache mmvq_q8_cache;
+    ggml_cuda_q8_pre        q8_pre;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

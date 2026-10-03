@@ -13,6 +13,10 @@ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
     const void * src1_q8_1 = nullptr);
 
+// Buffer for the q8_1 copy of t (contiguous, rows padded to MATRIX_ROW_PADDING) that the kernel computing t writes;
+// a later MMVQ with src1 = t (or a view of all of t) uses it instead of quantizing. nullptr if not possible.
+void * ggml_cuda_q8_pre_alloc(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
+
 // Several MMVQ (batch size 1) with the same src1 in one kernel launch, e.g. Q, K and V. HIP GCN only.
 bool ggml_cuda_mul_mat_vec_q_multi_supported(const ggml_tensor * const * src0s, const ggml_tensor * const * dsts, int n,
     const ggml_tensor * src1);
