@@ -1581,6 +1581,7 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_mmvq_q8_cache mmvq_q8_cache;
     ggml_cuda_q8_pre        q8_pre;
+    void *                  router_topk_scratch = nullptr; // counter + logits of the fused router top-k
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

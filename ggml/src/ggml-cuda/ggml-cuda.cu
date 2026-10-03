@@ -737,6 +737,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(mmvq_q8_cache.buf));
     }
+    if (router_topk_scratch != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(router_topk_scratch));
+    }
     for (ggml_cuda_q8_pre_slot & slot : q8_pre.slots) {
         if (slot.buf != nullptr) {
             ggml_cuda_set_device(device);
@@ -3766,6 +3770,23 @@ static bool ggml_cuda_fuse_glu_q8_enabled() {
     return enabled;
 }
 
+// GGML_CUDA_FUSE_ROUTER_TOPK=0/1: the MoE router mul_mat (F32) of one token and the softmax top-k after it run as one
+// kernel. Default on for HIP.
+static bool ggml_cuda_fuse_router_topk_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_ROUTER_TOPK");
+        if (env != nullptr) {
+            return atoi(env) != 0;
+        }
+#ifdef GGML_USE_HIP
+        return true;
+#else
+        return false;
+#endif // GGML_USE_HIP
+    }();
+    return enabled;
+}
+
 // GGML_CUDA_FUSE_NORM_Q8=0/1: rms_norm -> mul whose result feeds a MMVQ mul_mat also writes the q8_1 copy for it
 // (the separate quantize_q8_1 is skipped, same q8_1 data). Default on for HIP.
 static bool ggml_cuda_fuse_norm_q8_enabled() {
@@ -4013,6 +4034,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip;
+        }
+    }
+
+    // router mul_mat -> softmax top-k (MoE gating of one token): one kernel
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_fuse_router_topk_enabled() && i + 1 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_SOFT_MAX && cgraph->nodes[i + 1]->src[0] == node) {
+        ggml_cuda_topk_moe_args args;
+        if (ggml_cuda_topk_moe_fusion(cgraph, i + 1, args) && args.softmax && !args.delayed_softmax && !args.prob_bias) {
+            std::vector<ggml_op> ops = { GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW,
+                                         GGML_OP_GET_ROWS };
+            int out_nodes[2];
+            out_nodes[0] = i + 5;
+            ggml_tensor *       ids   = cgraph->nodes[out_nodes[0]];
+            const ggml_tensor * clamp = nullptr;
+            const ggml_tensor * scale = nullptr;
+            if (args.norm) {
+                ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+                clamp = cgraph->nodes[i + ops.size() - 3];
+            }
+            if (args.scale) {
+                ops.insert(ops.end(), { GGML_OP_SCALE });
+                scale = cgraph->nodes[i + ops.size() - 1];
+            }
+            ggml_tensor * weights = cgraph->nodes[i + ops.size() - 1];
+            out_nodes[1] = i + ops.size() - 1;
+
+            if (i + (int) ops.size() <= cgraph->n_nodes &&
+                    ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                    ggml_cuda_should_use_topk_moe(cgraph->nodes[i + 1], node, weights, ids) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true) &&
+                    ggml_cuda_router_topk_moe_supported(*cuda_ctx, node, nullptr, args)) {
+                ggml_cuda_op_router_topk_moe(*cuda_ctx, node, weights, ids, clamp, scale);
+                return ops.size() - 1;
+            }
         }
     }
 

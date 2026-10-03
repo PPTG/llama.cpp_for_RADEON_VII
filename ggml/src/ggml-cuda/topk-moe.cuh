@@ -25,6 +25,12 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             bias,
                            const ggml_cuda_topk_moe_args & args);
 
+// router mul_mat (F32 weight, one token) + softmax top-k in one kernel (HIP, 64 wide waves, 128/256/512 experts)
+bool ggml_cuda_router_topk_moe_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * bias,
+                                         const ggml_cuda_topk_moe_args & args);
+void ggml_cuda_op_router_topk_moe(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * weights,
+                                  ggml_tensor * ids, const ggml_tensor * clamp, const ggml_tensor * scale);
+
 bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * weights,
                                    const ggml_tensor * logits,

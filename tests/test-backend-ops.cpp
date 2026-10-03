@@ -7334,6 +7334,7 @@ struct test_topk_moe : public test_case {
     const bool bias_probs;
     const MoeGatingFunc gating_func;
     const float scale_w;
+    const int64_t n_embd_router; // > 0: the logits are a F32 router mul_mat of [n_embd_router, n_tokens]
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
 
@@ -7342,17 +7343,25 @@ struct test_topk_moe : public test_case {
                   bool                   with_norm       = false,
                   bool                   bias_probs      = false,
                   MoeGatingFunc          gating_func     = GATING_FUNC_SOFTMAX,
-                  float                  scale_w         = 0.0f) :
+                  float                  scale_w         = 0.0f,
+                  int64_t                n_embd_router   = 0) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
         bias_probs(bias_probs),
         gating_func(gating_func),
-        scale_w(scale_w) {
+        scale_w(scale_w),
+        n_embd_router(n_embd_router) {
         GGML_ASSERT(n_expert_used <= ne[0]);
+        GGML_ASSERT(n_embd_router == 0 || (ne[2] == 1 && ne[3] == 1));
     }
 
-    std::string vars() override { return VARS_TO_STR6(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w); }
+    std::string vars() override {
+        if (n_embd_router > 0) {
+            return VARS_TO_STR7(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w, n_embd_router);
+        }
+        return VARS_TO_STR6(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w);
+    }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -7365,7 +7374,14 @@ struct test_topk_moe : public test_case {
         const int n_expert = ne[0];
         const int n_tokens = ne[1];
 
-        ggml_tensor * logits = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * logits;
+        if (n_embd_router > 0) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_router, n_expert);
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_router, n_tokens);
+            logits = ggml_mul_mat(ctx, w, x);
+        } else {
+            logits = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        }
         ggml_tensor * probs            =
             (gating_func == GATING_FUNC_SOFTMAX) ? ggml_soft_max(ctx, logits) :
             (gating_func == GATING_FUNC_SIGMOID) ? ggml_sigmoid(ctx, logits) :
@@ -11813,6 +11829,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({32, 9, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
                 }
+            }
+        }
+    }
+
+    // router mul_mat + softmax top-k (fused into one kernel by some backends for one token)
+    for (bool with_norm : {false, true}) {
+        for (float scale_w : {0.0f, 2.0f}) {
+            for (int64_t n_tokens : {1, 3}) {
+                test_cases.emplace_back(new test_topk_moe({128, n_tokens, 1, 1}, 8, with_norm, false, GATING_FUNC_SOFTMAX, scale_w, 2816));
+                test_cases.emplace_back(new test_topk_moe({256, n_tokens, 1, 1}, 6, with_norm, false, GATING_FUNC_SOFTMAX, scale_w, 1024));
+                test_cases.emplace_back(new test_topk_moe({512, n_tokens, 1, 1}, 16, with_norm, false, GATING_FUNC_SOFTMAX, scale_w, 64));
             }
         }
     }
