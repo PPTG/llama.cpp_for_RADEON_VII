@@ -4045,7 +4045,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             std::vector<ggml_op> ops = { GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW,
                                          GGML_OP_GET_ROWS };
             int out_nodes[2];
-            out_nodes[0] = i + 5;
+            out_nodes[0] = i + 4; // the view of the argsort: mul_mat, soft_max, reshape, argsort, view
             ggml_tensor *       ids   = cgraph->nodes[out_nodes[0]];
             const ggml_tensor * clamp = nullptr;
             const ggml_tensor * scale = nullptr;
