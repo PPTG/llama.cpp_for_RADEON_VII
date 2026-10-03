@@ -443,6 +443,15 @@ static inline bool ggml_cuda_fattn_q8_wave_enabled() {
     return enabled;
 }
 
+// KV rows per wave the context is split into (1..64): fewer rows = more blocks for short contexts
+static inline int ggml_cuda_fattn_q8_wave_rows() {
+    static const int rows = [] {
+        const char * env = getenv("GGML_CUDA_FA_Q8_WAVE_ROWS");
+        return env ? std::max(1, std::min(fa_q8w_rows, atoi(env))) : fa_q8w_rows;
+    }();
+    return rows;
+}
+
 // true if flash_attn_q8_wave can compute dst (token generation, q8_0 K/V, head size 512, GQA multiple of 8, 64 wide waves)
 static inline bool ggml_cuda_fattn_q8_wave_supported(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -506,7 +515,8 @@ static inline void ggml_cuda_flash_attn_ext_q8_wave(ggml_backend_cuda_context & 
     nblocks_sm = std::max(nblocks_sm, 1);
 
     const int ntiles  = Q->ne[1] * (Q->ne[2]/fa_q8w_ncols) * Q->ne[3];
-    const int nchunks = (K->ne[1] + fa_q8w_nwaves*fa_q8w_rows - 1) / (fa_q8w_nwaves*fa_q8w_rows);
+    const int rows    = fa_q8w_nwaves*ggml_cuda_fattn_q8_wave_rows();
+    const int nchunks = (K->ne[1] + rows - 1) / rows;
     const int nparts  = std::max(1, std::min(nchunks, nblocks_sm*nsm / ntiles));
 
     ggml_cuda_pool_alloc<float>  dst_tmp(ctx.pool());
