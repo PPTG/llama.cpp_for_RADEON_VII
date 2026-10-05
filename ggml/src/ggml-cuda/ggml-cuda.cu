@@ -2560,6 +2560,36 @@ static bool ggml_cuda_use_staged_copy() {
     return use;
 }
 
+// HIP: the slots are fine-grained (coherent) pinned memory and the events release to system scope. The default
+// hipHostMalloc memory is coarse-grained: the GPU that reads a slot can see stale data of the previous use of the slot
+// (non-deterministic results with LLAMA_KV_SPLIT_HEADS and its second stream, where the H2D starts right after the D2H).
+// GGML_CUDA_STAGED_COPY_COHERENT=0 / GGML_CUDA_STAGED_COPY_SYSTEM_EVENT=0 restore the old behavior (for tests).
+static bool ggml_cuda_staged_copy_env(const char * name) {
+    const char * env = getenv(name);
+    return env == nullptr || atoi(env) != 0;
+}
+
+static void ggml_cuda_staged_copy_host_alloc(void ** ptr, const size_t size) {
+#ifdef GGML_USE_HIP
+    static const bool coherent = ggml_cuda_staged_copy_env("GGML_CUDA_STAGED_COPY_COHERENT");
+    if (coherent) {
+        CUDA_CHECK(hipHostMalloc(ptr, size, hipHostMallocCoherent | hipHostMallocPortable));
+        return;
+    }
+#endif // GGML_USE_HIP
+    CUDA_CHECK(cudaMallocHost(ptr, size));
+}
+
+static unsigned int ggml_cuda_staged_copy_event_flags() {
+#ifdef GGML_USE_HIP
+    static const bool system_event = ggml_cuda_staged_copy_env("GGML_CUDA_STAGED_COPY_SYSTEM_EVENT");
+    if (system_event) {
+        return cudaEventDisableTiming | hipEventReleaseToSystem;
+    }
+#endif // GGML_USE_HIP
+    return cudaEventDisableTiming;
+}
+
 static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst, void * dst, const void * src, const size_t nbytes) {
     // a free slot (its last H2D done) that is large enough: reusing a busy slot makes the src stream wait for the dst
     // stream (e.g. for the H2D of a layer split boundary queued behind the previous ubatch of the other GPU), growing a
@@ -2611,7 +2641,7 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
             CUDA_CHECK(cudaEventDestroy(slot.h2d_done));
         }
         ggml_cuda_set_device(ctx_dst->device);
-        CUDA_CHECK(cudaEventCreateWithFlags(&slot.h2d_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&slot.h2d_done, ggml_cuda_staged_copy_event_flags()));
         slot.dst_device = ctx_dst->device;
         slot.used       = false;
     }
@@ -2624,13 +2654,13 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
             CUDA_CHECK(cudaFreeHost(slot.host));
         }
         slot.size = std::max(nbytes, (size_t) 64*1024);
-        CUDA_CHECK(cudaMallocHost(&slot.host, slot.size));
+        ggml_cuda_staged_copy_host_alloc(&slot.host, slot.size);
         slot.used = false;
     }
 
     ggml_cuda_set_device(ctx_src->device);
     if (slot.d2h_done == nullptr) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&slot.d2h_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&slot.d2h_done, ggml_cuda_staged_copy_event_flags()));
     }
     // do not overwrite the slot before the previous H2D from it is done
     if (slot.used) {
