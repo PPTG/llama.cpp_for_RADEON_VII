@@ -1528,6 +1528,9 @@ struct ggml_cuda_staged_copy_slot {
     bool        used       = false;   // h2d_done was recorded at least once
     cudaEvent_t d2h_done   = nullptr; // created on the src device
     cudaEvent_t h2d_done   = nullptr; // created on the dst device
+    // flag mode: [0] number of the last D2H into the slot, [32] number of the last H2D out of it (coherent pinned memory)
+    unsigned int * flags   = nullptr;
+    unsigned int   seq     = 0;       // number of the last copy through the slot
 };
 
 // slots are added while all are busy, up to this number
