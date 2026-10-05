@@ -2590,6 +2590,38 @@ static unsigned int ggml_cuda_staged_copy_event_flags() {
     return cudaEventDisableTiming;
 }
 
+// Copy by a kernel, between device memory and the coherent pinned memory of a slot. The system fence at the end makes
+// the writes visible to the other GPU before the event recorded after the kernel. The D2H and H2D runtime copies (SDMA)
+// did not guarantee that: the event on the src GPU completed before the other GPU read the data of the slot, decoding
+// with LLAMA_KV_SPLIT_HEADS and its second stream was not deterministic (a host wait for the D2H fixed it).
+static __global__ void ggml_cuda_staged_copy_kernel(const char * __restrict__ src, char * __restrict__ dst, const size_t nbytes) {
+    const size_t tid     = (size_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const size_t nthread = (size_t) gridDim.x*blockDim.x;
+    const size_t n16     = nbytes / 16;
+    for (size_t i = tid; i < n16; i += nthread) {
+        ((int4 *) dst)[i] = ((const int4 *) src)[i];
+    }
+    for (size_t i = n16*16 + tid; i < nbytes; i += nthread) {
+        dst[i] = src[i];
+    }
+    __threadfence_system();
+}
+
+// GGML_CUDA_STAGED_COPY_KERNEL=1: the two copies of the staged copy by ggml_cuda_staged_copy_kernel instead of the
+// runtime D2H / H2D (needs the coherent slots, 16 byte aligned pointers)
+static bool ggml_cuda_staged_copy_by_kernel(const void * a, const void * b) {
+    static const bool use = getenv("GGML_CUDA_STAGED_COPY_KERNEL") != nullptr && atoi(getenv("GGML_CUDA_STAGED_COPY_KERNEL")) != 0 &&
+        ggml_cuda_staged_copy_env("GGML_CUDA_STAGED_COPY_COHERENT");
+    return use && (uintptr_t) a % 16 == 0 && (uintptr_t) b % 16 == 0;
+}
+
+static void ggml_cuda_staged_copy_launch(const void * src, void * dst, const size_t nbytes, cudaStream_t stream) {
+    const int nthreads = 256;
+    const int nblocks  = (int) std::min<size_t>((nbytes/16 + nthreads - 1) / nthreads + 1, 128);
+    ggml_cuda_staged_copy_kernel<<<nblocks, nthreads, 0, stream>>>((const char *) src, (char *) dst, nbytes);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst, void * dst, const void * src, const size_t nbytes) {
     // a free slot (its last H2D done) that is large enough: reusing a busy slot makes the src stream wait for the dst
     // stream (e.g. for the H2D of a layer split boundary queued behind the previous ubatch of the other GPU), growing a
@@ -2674,7 +2706,12 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
         }
         CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), slot.h2d_done, 0));
     }
-    CUDA_CHECK(cudaMemcpyAsync(slot.host, src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream()));
+    const bool by_kernel = ggml_cuda_staged_copy_by_kernel(src, dst);
+    if (by_kernel) {
+        ggml_cuda_staged_copy_launch(src, slot.host, nbytes, ctx_src->stream());
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(slot.host, src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream()));
+    }
     CUDA_CHECK(cudaEventRecord(slot.d2h_done, ctx_src->stream()));
     if (host_sync) {
         CUDA_CHECK(cudaEventSynchronize(slot.d2h_done));
@@ -2682,7 +2719,11 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
 
     ggml_cuda_set_device(ctx_dst->device);
     CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), slot.d2h_done, 0));
-    CUDA_CHECK(cudaMemcpyAsync(dst, slot.host, nbytes, cudaMemcpyHostToDevice, ctx_dst->stream()));
+    if (by_kernel) {
+        ggml_cuda_staged_copy_launch(slot.host, dst, nbytes, ctx_dst->stream());
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(dst, slot.host, nbytes, cudaMemcpyHostToDevice, ctx_dst->stream()));
+    }
     CUDA_CHECK(cudaEventRecord(slot.h2d_done, ctx_dst->stream()));
     slot.used = true;
 
