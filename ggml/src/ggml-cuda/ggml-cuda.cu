@@ -72,7 +72,6 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
-#include <thread>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -755,12 +754,6 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
         if (slot.d2h_done != nullptr) {
             CUDA_CHECK(cudaEventDestroy(slot.d2h_done));
-        }
-        if (slot.flags != nullptr) {
-            while (((volatile unsigned int *) slot.flags)[32] != slot.seq) {
-                std::this_thread::yield();
-            }
-            CUDA_CHECK(cudaFreeHost(slot.flags));
         }
         if (slot.host != nullptr) {
             CUDA_CHECK(cudaFreeHost(slot.host));
@@ -2614,69 +2607,19 @@ static __global__ void ggml_cuda_staged_copy_kernel(const char * __restrict__ sr
     __threadfence_system();
 }
 
-// Flag mode (default): the order of the two copies is kept by flags in coherent pinned memory instead of events.
-// hipStreamWaitEvent on an event of the other GPU did not make the stream wait for the D2H in all cases: decoding with
-// LLAMA_KV_SPLIT_HEADS and its second stream (an idle dst stream starts the H2D at once) was not deterministic, a host
-// wait for the D2H fixed it but cost 29 % pp. Here a kernel of the dst stream spins on the D2H flag, a kernel of the
-// src stream on the H2D flag of the previous use of the slot; each kernel copies and then sets its flag.
-// GGML_CUDA_STAGED_COPY_FLAGS=0: event mode.
-static bool ggml_cuda_staged_copy_flags() {
-    static const bool use = ggml_cuda_staged_copy_env("GGML_CUDA_STAGED_COPY_FLAGS");
-    return use;
+// GGML_CUDA_STAGED_COPY_KERNEL=1: the two copies of the staged copy by ggml_cuda_staged_copy_kernel instead of the
+// runtime D2H / H2D (needs the coherent slots, 16 byte aligned pointers)
+static bool ggml_cuda_staged_copy_by_kernel(const void * a, const void * b) {
+    static const bool use = getenv("GGML_CUDA_STAGED_COPY_KERNEL") != nullptr && atoi(getenv("GGML_CUDA_STAGED_COPY_KERNEL")) != 0 &&
+        ggml_cuda_staged_copy_env("GGML_CUDA_STAGED_COPY_COHERENT");
+    return use && (uintptr_t) a % 16 == 0 && (uintptr_t) b % 16 == 0;
 }
 
-static __device__ __forceinline__ void ggml_cuda_staged_spin(const volatile unsigned int * flag, const unsigned int val) {
-    while (*flag != val) {
-#ifdef GGML_USE_HIP
-        __builtin_amdgcn_s_sleep(2);
-#endif // GGML_USE_HIP
-    }
-}
-
-// one block: wait until *wait_flag == wait_val (if wait_flag), copy nbytes, then *sig_flag = sig_val (if sig_flag)
-static __global__ void ggml_cuda_staged_flag_kernel(const char * __restrict__ src, char * __restrict__ dst, const size_t nbytes,
-        const unsigned int * wait_flag, const unsigned int wait_val, unsigned int * sig_flag, const unsigned int sig_val) {
-    if (wait_flag != nullptr && threadIdx.x == 0) {
-        ggml_cuda_staged_spin(wait_flag, wait_val);
-    }
-    __syncthreads();
-    __threadfence_system();
-
-    const bool   aligned = (uintptr_t) src % 16 == 0 && (uintptr_t) dst % 16 == 0;
-    const size_t n16     = aligned ? nbytes / 16 : 0;
-    for (size_t i = threadIdx.x; i < n16; i += blockDim.x) {
-        ((int4 *) dst)[i] = ((const int4 *) src)[i];
-    }
-    for (size_t i = n16*16 + threadIdx.x; i < nbytes; i += blockDim.x) {
-        dst[i] = src[i];
-    }
-
-    __threadfence_system();
-    __syncthreads();
-    if (sig_flag != nullptr && threadIdx.x == 0) {
-        *(volatile unsigned int *) sig_flag = sig_val;
-        __threadfence_system();
-    }
-}
-
-// wait, copy, signal on one stream; one block up to 256 KiB (decode), else wait / multi block copy / signal kernels
-static void ggml_cuda_staged_flag_copy(int device, cudaStream_t stream, const void * src, void * dst, const size_t nbytes,
-        const unsigned int * wait_flag, const unsigned int wait_val, unsigned int * sig_flag, const unsigned int sig_val) {
-    ggml_cuda_set_device(device);
-    if (nbytes <= 256*1024 || (uintptr_t) src % 16 != 0 || (uintptr_t) dst % 16 != 0) {
-        ggml_cuda_staged_flag_kernel<<<1, 1024, 0, stream>>>((const char *) src, (char *) dst, nbytes, wait_flag, wait_val, sig_flag, sig_val);
-    } else {
-        ggml_cuda_staged_flag_kernel<<<1, 64, 0, stream>>>(nullptr, nullptr, 0, wait_flag, wait_val, nullptr, 0);
-        const int nthreads = 256;
-        const int nblocks  = (int) std::min<size_t>((nbytes/16 + nthreads - 1) / nthreads + 1, 128);
-        ggml_cuda_staged_copy_kernel<<<nblocks, nthreads, 0, stream>>>((const char *) src, (char *) dst, nbytes);
-        ggml_cuda_staged_flag_kernel<<<1, 64, 0, stream>>>(nullptr, nullptr, 0, nullptr, 0, sig_flag, sig_val);
-    }
+static void ggml_cuda_staged_copy_launch(const void * src, void * dst, const size_t nbytes, cudaStream_t stream) {
+    const int nthreads = 256;
+    const int nblocks  = (int) std::min<size_t>((nbytes/16 + nthreads - 1) / nthreads + 1, 128);
+    ggml_cuda_staged_copy_kernel<<<nblocks, nthreads, 0, stream>>>((const char *) src, (char *) dst, nbytes);
     CUDA_CHECK(cudaGetLastError());
-}
-
-static unsigned int ggml_cuda_staged_flag_load(const unsigned int * flag) {
-    return *(const volatile unsigned int *) flag;
 }
 
 static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst, void * dst, const void * src, const size_t nbytes) {
@@ -2689,9 +2632,7 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
     int idx_free = -1; // largest free slot
     for (int i = 0; i < n_slots; ++i) {
         bool free = !slots[i].used;
-        if (slots[i].flags != nullptr) {
-            free = ggml_cuda_staged_flag_load(slots[i].flags + 32) == slots[i].seq;
-        } else if (!free) {
+        if (!free) {
             const cudaError_t err = cudaEventQuery(slots[i].h2d_done);
             if (err == cudaSuccess) {
                 free = true;
@@ -2739,11 +2680,7 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
 
     if (slot.size < nbytes) {
         if (slot.host != nullptr) {
-            if (slot.flags != nullptr) {
-                while (ggml_cuda_staged_flag_load(slot.flags + 32) != slot.seq) {
-                    std::this_thread::yield();
-                }
-            } else if (slot.used) {
+            if (slot.used) {
                 CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
             }
             CUDA_CHECK(cudaFreeHost(slot.host));
@@ -2751,25 +2688,6 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
         slot.size = std::max(nbytes, (size_t) 64*1024);
         ggml_cuda_staged_copy_host_alloc(&slot.host, slot.size);
         slot.used = false;
-    }
-
-    if (ggml_cuda_staged_copy_flags()) {
-        if (slot.flags == nullptr) {
-            ggml_cuda_staged_copy_host_alloc((void **) &slot.flags, 64*sizeof(unsigned int));
-            memset(slot.flags, 0, 64*sizeof(unsigned int));
-            slot.seq = 0;
-        }
-        // the slot is free once the H2D of its previous copy is done (flag [32] == seq), whatever the device
-        const unsigned int prev = slot.seq;
-        const unsigned int seq  = prev + 1;
-        slot.seq  = seq;
-        slot.used = true;
-        ggml_cuda_staged_flag_copy(ctx_src->device, ctx_src->stream(), src, slot.host, nbytes,
-            prev != 0 ? slot.flags + 32 : nullptr, prev, slot.flags, seq);
-        ggml_cuda_staged_flag_copy(ctx_dst->device, ctx_dst->stream(), slot.host, dst, nbytes,
-            slot.flags, seq, slot.flags + 32, seq);
-        ggml_cuda_set_device(ctx_src->device);
-        return;
     }
 
     ggml_cuda_set_device(ctx_src->device);
@@ -2788,7 +2706,12 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
         }
         CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), slot.h2d_done, 0));
     }
-    CUDA_CHECK(cudaMemcpyAsync(slot.host, src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream()));
+    const bool by_kernel = ggml_cuda_staged_copy_by_kernel(src, dst);
+    if (by_kernel) {
+        ggml_cuda_staged_copy_launch(src, slot.host, nbytes, ctx_src->stream());
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(slot.host, src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream()));
+    }
     CUDA_CHECK(cudaEventRecord(slot.d2h_done, ctx_src->stream()));
     if (host_sync) {
         CUDA_CHECK(cudaEventSynchronize(slot.d2h_done));
@@ -2796,7 +2719,11 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
 
     ggml_cuda_set_device(ctx_dst->device);
     CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), slot.d2h_done, 0));
-    CUDA_CHECK(cudaMemcpyAsync(dst, slot.host, nbytes, cudaMemcpyHostToDevice, ctx_dst->stream()));
+    if (by_kernel) {
+        ggml_cuda_staged_copy_launch(slot.host, dst, nbytes, ctx_dst->stream());
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(dst, slot.host, nbytes, cudaMemcpyHostToDevice, ctx_dst->stream()));
+    }
     CUDA_CHECK(cudaEventRecord(slot.h2d_done, ctx_dst->stream()));
     slot.used = true;
 
