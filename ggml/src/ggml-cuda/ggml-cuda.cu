@@ -3852,6 +3852,14 @@ static bool ggml_cuda_fuse_fwht_enabled() {
     return enabled;
 }
 
+// parts of GGML_CUDA_FUSE_FWHT (diagnostics), all default on when it is on:
+// GGML_CUDA_FUSE_FWHT_SET_ROWS (fwht -> set_rows), GGML_CUDA_FUSE_FWHT_MMVQ (fwht -> q8_1 for MMVQ),
+// GGML_CUDA_FUSE_FWHT_ROPE (rms_norm -> mul -> rope -> fwht of Q), GGML_CUDA_FUSE_FWHT_REORDER (graph_optimize move)
+static bool ggml_cuda_fuse_fwht_part(const char * name) {
+    const char * env = getenv(name);
+    return ggml_cuda_fuse_fwht_enabled() && (env == nullptr || atoi(env) != 0);
+}
+
 static bool ggml_cuda_is_fwht_node(const ggml_tensor * node) {
     return node->op == GGML_OP_MUL_MAT && ggml_cuda_op_mul_mat_use_fwht(node);
 }
@@ -4628,12 +4636,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_tensor * consumer = cgraph->nodes[j];
             ops[j - i] = consumer->op;
             const int n = j - i + 1;
-            if (consumer->op == GGML_OP_SET_ROWS && ggml_cuda_fwht_set_rows_supported(node, consumer) &&
+            static const bool fuse_set_rows = ggml_cuda_fuse_fwht_part("GGML_CUDA_FUSE_FWHT_SET_ROWS");
+            static const bool fuse_mmvq     = ggml_cuda_fuse_fwht_part("GGML_CUDA_FUSE_FWHT_MMVQ");
+            if (fuse_set_rows && consumer->op == GGML_OP_SET_ROWS && ggml_cuda_fwht_set_rows_supported(node, consumer) &&
                     ggml_can_fuse_subgraph(cgraph, i, n, ops, &j, 1)) {
                 ggml_cuda_op_fwht_set_rows(*cuda_ctx, node, consumer);
                 return n - 1;
             }
-            if (consumer->op == GGML_OP_MUL_MAT && ggml_is_quantized(consumer->src[0]->type) &&
+            if (fuse_mmvq && consumer->op == GGML_OP_MUL_MAT && ggml_is_quantized(consumer->src[0]->type) &&
                     ggml_cuda_should_fuse_mul_mat_vec_q(consumer) &&
                     ggml_cuda_fwht_quantize_q8_1_supported(node, consumer->src[1]) &&
                     ggml_can_fuse_subgraph(cgraph, i, n, ops, &j, 1)) {
@@ -4864,7 +4874,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // rms_norm -> mul -> rope -> reshape -> Hadamard mul_mat (the Q rotation for a quantized KV cache, rotation size =
     // row size) as one kernel
-    if (ggml_cuda_fuse_fwht_enabled() && node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes) {
+    static const bool fuse_fwht_rope = ggml_cuda_fuse_fwht_part("GGML_CUDA_FUSE_FWHT_ROPE");
+    if (fuse_fwht_rope && node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes) {
         ggml_tensor * mul  = cgraph->nodes[i + 1];
         ggml_tensor * rope = cgraph->nodes[i + 2];
         ggml_tensor * resh = cgraph->nodes[i + 3];
@@ -5346,7 +5357,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     // Move a set_rows that stores the output of a fwht (Hadamard rotation of K/V for a quantized cache), together with
     // its view nodes, right behind the fwht, so they can run as one kernel (see ggml_cuda_fuse_fwht_enabled). The nodes
     // it jumps over must not touch the cache or compute the row indices.
-    if (!disable_fusion && ggml_cuda_fuse_fwht_enabled()) {
+    if (!disable_fusion && ggml_cuda_fuse_fwht_part("GGML_CUDA_FUSE_FWHT_REORDER")) {
         constexpr int max_lookahead = 32;
         std::vector<ggml_tensor *> moved;
         std::vector<ggml_tensor *> rest;
