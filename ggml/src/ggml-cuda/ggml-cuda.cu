@@ -2662,23 +2662,12 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
     if (slot.d2h_done == nullptr) {
         CUDA_CHECK(cudaEventCreateWithFlags(&slot.d2h_done, ggml_cuda_staged_copy_event_flags()));
     }
-    // diagnostics: GGML_CUDA_STAGED_COPY_REUSE_SYNC=1 waits on the host for the previous H2D of the slot,
-    // GGML_CUDA_STAGED_COPY_HOST_SYNC=1 waits on the host for the D2H before queueing the H2D
-    static const bool reuse_sync = getenv("GGML_CUDA_STAGED_COPY_REUSE_SYNC") && atoi(getenv("GGML_CUDA_STAGED_COPY_REUSE_SYNC"));
-    static const bool host_sync  = getenv("GGML_CUDA_STAGED_COPY_HOST_SYNC")  && atoi(getenv("GGML_CUDA_STAGED_COPY_HOST_SYNC"));
-
     // do not overwrite the slot before the previous H2D from it is done
     if (slot.used) {
-        if (reuse_sync) {
-            CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
-        }
         CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), slot.h2d_done, 0));
     }
     CUDA_CHECK(cudaMemcpyAsync(slot.host, src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream()));
     CUDA_CHECK(cudaEventRecord(slot.d2h_done, ctx_src->stream()));
-    if (host_sync) {
-        CUDA_CHECK(cudaEventSynchronize(slot.d2h_done));
-    }
 
     ggml_cuda_set_device(ctx_dst->device);
     CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), slot.d2h_done, 0));
@@ -2718,13 +2707,6 @@ static bool ggml_cuda_peer_copy(ggml_backend_cuda_context * ctx_src, void * dst,
     return true;
 }
 
-// GGML_CUDA_SAME_DEVICE_COPY_ON_DST=0: copy between two backends of one device on the src stream (as upstream), which does
-// not wait for the reads of dst on the dst stream
-static bool ggml_cuda_same_device_copy_on_dst() {
-    static const bool on_dst = ggml_cuda_staged_copy_env("GGML_CUDA_SAME_DEVICE_COPY_ON_DST");
-    return on_dst;
-}
-
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -2757,23 +2739,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
-        if (src_physical == dst_physical && ggml_cuda_same_device_copy_on_dst()) {
-            // two backends (streams) of one device: the dst stream waits for the src stream and copies, so the copy is
-            // ordered after the src writes and after the earlier reads of dst on the dst stream; the src stream then
-            // waits for the copy before it can reuse the memory of src
-            ggml_cuda_set_device(cuda_ctx_src->device);
-            for (ggml_backend_cuda_context * c : { cuda_ctx_src, cuda_ctx_dst }) {
-                if (!c->copy_event) {
-                    CUDA_CHECK(cudaEventCreateWithFlags(&c->copy_event, cudaEventDisableTiming));
-                }
-            }
-            CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
-            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_dst->stream()));
-            CUDA_CHECK(cudaEventRecord(cuda_ctx_dst->copy_event, cuda_ctx_dst->stream()));
-            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_dst->copy_event, 0));
-            return true;
-        } else if (src_physical == dst_physical) {
+        if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else if (ggml_cuda_peer_copy(cuda_ctx_src, dst->data, src->data, ggml_nbytes(dst))) {
             // done on the src stream, the event below orders it with the dst stream
