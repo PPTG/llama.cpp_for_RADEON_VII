@@ -39,7 +39,7 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
 template <int N, typename T, typename idx_t>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
 __global__ void fwht_set_rows_q8_0_cuda(const T * src, char * dst, const idx_t * idx, const int64_t n_rows, const float scale,
-                                        const int rows_per_idx, const int64_t s_idx, const int64_t nb_dst1) {
+                                        const int rows_per_idx, const int64_t s_idx, const int64_t nb_dst1, float * out) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     static_assert(warp_size % QK8_0 == 0, "bad warp size");
 
@@ -66,6 +66,14 @@ __global__ void fwht_set_rows_q8_0_cuda(const T * src, char * dst, const idx_t *
 
     fwht_row<N>(reg, lane);
 
+    // the fwht output itself, it can have other readers (e.g. a view of it copied to another backend)
+    if (out != nullptr) {
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            out[r * N + i * warp_size + lane] = reg[i];
+        }
+    }
+
     block_q8_0 * y = (block_q8_0 *) (dst + dst_row * nb_dst1) + ((int) r - i_tok*rows_per_idx) * (N / QK8_0);
 
 #pragma unroll
@@ -87,7 +95,7 @@ __global__ void fwht_set_rows_q8_0_cuda(const T * src, char * dst, const idx_t *
 template <int N, typename T>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
 __global__ void fwht_quantize_q8_1_cuda(const T * src, void * vy, const int64_t n_rows, const float scale,
-                                        const int64_t ne10, const int64_t ne10_padded) {
+                                        const int64_t ne10, const int64_t ne10_padded, float * out) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     static_assert(warp_size % QK8_1 == 0, "bad warp size");
 
@@ -110,6 +118,13 @@ __global__ void fwht_quantize_q8_1_cuda(const T * src, void * vy, const int64_t 
     }
 
     fwht_row<N>(reg, lane);
+
+    if (out != nullptr) {
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            out[r * N + i * warp_size + lane] = reg[i];
+        }
+    }
 
     const int64_t i10 = (r * N) % ne10;
     const int64_t i11 = (r * N) / ne10;
@@ -248,6 +263,8 @@ static void ggml_cuda_op_fwht_set_rows_impl(ggml_backend_cuda_context & ctx, con
     const T *     src_d = (const T *) src->data;
     const idx_t * idx_d = (const idx_t *) idx->data;
     char *        dst_d = (char *) set_rows->data;
+    // also store the fwht output: a fusion only sees the readers in the graph split of this backend
+    float *       out_d = fwht->type == GGML_TYPE_F32 && ggml_is_contiguous(fwht) ? (float *) fwht->data : nullptr;
 
     const int     rows_per_idx = set_rows->src[0]->ne[0] / n;
     GGML_ASSERT(rows < INT32_MAX);
@@ -265,16 +282,16 @@ static void ggml_cuda_op_fwht_set_rows_impl(ggml_backend_cuda_context & ctx, con
 
     switch (n) {
         case 64:
-            ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda<64, T, idx_t>, launch_params, src_d, dst_d, idx_d, rows, scale, rows_per_idx, s_idx, nb_dst1);
+            ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda<64, T, idx_t>, launch_params, src_d, dst_d, idx_d, rows, scale, rows_per_idx, s_idx, nb_dst1, out_d);
             break;
         case 128:
-            ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda<128, T, idx_t>, launch_params, src_d, dst_d, idx_d, rows, scale, rows_per_idx, s_idx, nb_dst1);
+            ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda<128, T, idx_t>, launch_params, src_d, dst_d, idx_d, rows, scale, rows_per_idx, s_idx, nb_dst1, out_d);
             break;
         case 256:
-            ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda<256, T, idx_t>, launch_params, src_d, dst_d, idx_d, rows, scale, rows_per_idx, s_idx, nb_dst1);
+            ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda<256, T, idx_t>, launch_params, src_d, dst_d, idx_d, rows, scale, rows_per_idx, s_idx, nb_dst1, out_d);
             break;
         case 512:
-            ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda<512, T, idx_t>, launch_params, src_d, dst_d, idx_d, rows, scale, rows_per_idx, s_idx, nb_dst1);
+            ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda<512, T, idx_t>, launch_params, src_d, dst_d, idx_d, rows, scale, rows_per_idx, s_idx, nb_dst1, out_d);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -310,6 +327,7 @@ static void ggml_cuda_fwht_quantize_q8_1_impl(ggml_backend_cuda_context & ctx, c
     const int64_t       ne10 = src1->ne[0];
 
     const T * src_d = (const T *) src->data;
+    float *   out_d = fwht->type == GGML_TYPE_F32 && ggml_is_contiguous(fwht) ? (float *) fwht->data : nullptr;
 
     const int warp_size      = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int rows_per_block = 4;
@@ -322,16 +340,16 @@ static void ggml_cuda_fwht_quantize_q8_1_impl(ggml_backend_cuda_context & ctx, c
 
     switch (n) {
         case 64:
-            ggml_cuda_kernel_launch(fwht_quantize_q8_1_cuda<64, T>, launch_params, src_d, q8, rows, scale, ne10, ne10_padded);
+            ggml_cuda_kernel_launch(fwht_quantize_q8_1_cuda<64, T>, launch_params, src_d, q8, rows, scale, ne10, ne10_padded, out_d);
             break;
         case 128:
-            ggml_cuda_kernel_launch(fwht_quantize_q8_1_cuda<128, T>, launch_params, src_d, q8, rows, scale, ne10, ne10_padded);
+            ggml_cuda_kernel_launch(fwht_quantize_q8_1_cuda<128, T>, launch_params, src_d, q8, rows, scale, ne10, ne10_padded, out_d);
             break;
         case 256:
-            ggml_cuda_kernel_launch(fwht_quantize_q8_1_cuda<256, T>, launch_params, src_d, q8, rows, scale, ne10, ne10_padded);
+            ggml_cuda_kernel_launch(fwht_quantize_q8_1_cuda<256, T>, launch_params, src_d, q8, rows, scale, ne10, ne10_padded, out_d);
             break;
         case 512:
-            ggml_cuda_kernel_launch(fwht_quantize_q8_1_cuda<512, T>, launch_params, src_d, q8, rows, scale, ne10, ne10_padded);
+            ggml_cuda_kernel_launch(fwht_quantize_q8_1_cuda<512, T>, launch_params, src_d, q8, rows, scale, ne10, ne10_padded, out_d);
             break;
         default:
             GGML_ABORT("fatal error");
