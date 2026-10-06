@@ -539,7 +539,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // Example, we have a context window of 512, we will compute perplexity for each of the
     // last 256 tokens.  Then, we split the input up into context window size chunks to
     // process the entire prompt.
-    const int first = n_ctx/2;
+    // LLAMA_PPL_FIRST: first token of a chunk with logits (default n_ctx/2), for comparing the logits of two runs
+    // (--kl-divergence-base), not for perplexity numbers
+    const int first = getenv("LLAMA_PPL_FIRST") ? std::max(1, std::min(n_ctx - 2, atoi(getenv("LLAMA_PPL_FIRST")))) : n_ctx/2;
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
