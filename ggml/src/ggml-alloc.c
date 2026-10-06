@@ -496,6 +496,10 @@ struct ggml_gallocr {
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+    return ggml_gallocr_new_n_own(bufts, NULL, n_bufs);
+}
+
+ggml_gallocr_t ggml_gallocr_new_n_own(ggml_backend_buffer_type_t * bufts, const bool * own, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
     GGML_ASSERT(galloc != NULL);
 
@@ -513,8 +517,8 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
         galloc->buffers[i] = NULL;
 
         // check if the same buffer type is used multiple times and reuse the same allocator
-        for (int j = 0; j < i; j++) {
-            if (bufts[i] == bufts[j]) {
+        for (int j = 0; j < i && !(own && own[i]); j++) {
+            if (bufts[i] == bufts[j] && !(own && own[j])) {
                 galloc->buf_tallocs[i] = galloc->buf_tallocs[j];
                 break;
             }

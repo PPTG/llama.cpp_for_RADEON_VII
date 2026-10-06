@@ -2005,7 +2005,26 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+    // two GPU backends of one device (streams, LLAMA_KV_SPLIT_HEADS) get separate compute buffers: one shared buffer is
+    // filled as if the splits ran in order, but the streams overlap (consecutive graphs: the next graph of one stream
+    // overwrote the tensors of the other stream still in use); GGML_SCHED_SHARE_DEVICE_BUFFER=1 shares it
+    bool own[GGML_SCHED_MAX_BACKENDS] = { false };
+    {
+        const char * share = getenv("GGML_SCHED_SHARE_DEVICE_BUFFER");
+        if (share == nullptr || atoi(share) == 0) {
+            for (int b = 0; b < n_backends; b++) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(backends[b])) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    continue;
+                }
+                for (int o = 0; o < n_backends; o++) {
+                    if (o != b && ggml_backend_get_device(backends[o]) == ggml_backend_get_device(backends[b])) {
+                        own[b] = true;
+                    }
+                }
+            }
+        }
+    }
+    sched->galloc = ggml_gallocr_new_n_own(sched->bufts, own, n_backends);
     sched->op_offload = op_offload;
 
     ggml_backend_sched_reset(sched);
