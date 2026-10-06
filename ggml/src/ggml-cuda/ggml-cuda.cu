@@ -2572,16 +2572,20 @@ static bool ggml_cuda_staged_env(const char * name) {
     return v != nullptr && atoi(v) != 0;
 }
 
-static void ggml_cuda_staged_memcpy(void * dst, const void * src, const size_t nbytes, cudaMemcpyKind kind, cudaStream_t stream) {
-    static const bool use_kernel = ggml_cuda_staged_env("GGML_CUDA_STAGED_KERNEL");
-    if (!use_kernel) {
-        CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, kind, stream));
-        return;
-    }
+static void ggml_cuda_staged_memcpy_kernel(void * dst, const void * src, const size_t nbytes, cudaStream_t stream) {
     const int nthreads = 256;
     const int nblocks  = (int) std::min<size_t>((nbytes/16 + nthreads - 1) / nthreads + 1, 256);
     ggml_cuda_peer_copy_kernel<<<nblocks, nthreads, 0, stream>>>((const char *) src, (char *) dst, nbytes);
     CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_staged_memcpy(void * dst, const void * src, const size_t nbytes, cudaMemcpyKind kind, cudaStream_t stream) {
+    static const bool use_kernel = ggml_cuda_staged_env("GGML_CUDA_STAGED_KERNEL");
+    if (use_kernel) {
+        ggml_cuda_staged_memcpy_kernel(dst, src, nbytes, stream);
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, kind, stream));
+    }
 }
 
 static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst, void * dst, const void * src, const size_t nbytes) {
@@ -2793,7 +2797,11 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
-        if (src_physical == dst_physical) {
+        static const bool d2d_kernel = ggml_cuda_staged_env("GGML_CUDA_D2D_KERNEL"); // diagnostics: no SDMA copy
+        if (src_physical == dst_physical && d2d_kernel && (uintptr_t) src->data % 16 == 0 && (uintptr_t) dst->data % 16 == 0) {
+            ggml_cuda_set_device(cuda_ctx_src->device);
+            ggml_cuda_staged_memcpy_kernel(dst->data, src->data, ggml_nbytes(dst), cuda_ctx_src->stream());
+        } else if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else if (ggml_cuda_peer_copy(cuda_ctx_src, dst->data, src->data, ggml_nbytes(dst))) {
             // done on the src stream, the event below orders it with the dst stream
