@@ -2560,6 +2560,27 @@ static bool ggml_cuda_use_staged_copy() {
     return use;
 }
 
+static __global__ void ggml_cuda_peer_copy_kernel(const char * __restrict__ src, char * __restrict__ dst, const size_t nbytes);
+
+// diagnostics: GGML_CUDA_STAGED_KERNEL=1 copies to and from the pinned memory by a kernel on the stream instead of
+// cudaMemcpyAsync, GGML_CUDA_STAGED_COHERENT=1 allocates it coherent (not cached by the GPUs)
+static bool ggml_cuda_staged_env(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && atoi(v) != 0;
+}
+
+static void ggml_cuda_staged_memcpy(void * dst, const void * src, const size_t nbytes, cudaMemcpyKind kind, cudaStream_t stream) {
+    static const bool use_kernel = ggml_cuda_staged_env("GGML_CUDA_STAGED_KERNEL");
+    if (!use_kernel) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, kind, stream));
+        return;
+    }
+    const int nthreads = 256;
+    const int nblocks  = (int) std::min<size_t>((nbytes/16 + nthreads - 1) / nthreads + 1, 256);
+    ggml_cuda_peer_copy_kernel<<<nblocks, nthreads, 0, stream>>>((const char *) src, (char *) dst, nbytes);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst, void * dst, const void * src, const size_t nbytes) {
     // a free slot (its last H2D done) that is large enough: reusing a busy slot makes the src stream wait for the dst
     // stream (e.g. for the H2D of a layer split boundary queued behind the previous ubatch of the other GPU), growing a
@@ -2624,7 +2645,12 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
             CUDA_CHECK(cudaFreeHost(slot.host));
         }
         slot.size = std::max(nbytes, (size_t) 64*1024);
+#ifdef GGML_USE_HIP
+        static const bool coherent = ggml_cuda_staged_env("GGML_CUDA_STAGED_COHERENT");
+        CUDA_CHECK(hipHostMalloc(&slot.host, slot.size, coherent ? hipHostMallocCoherent : hipHostMallocDefault));
+#else
         CUDA_CHECK(cudaMallocHost(&slot.host, slot.size));
+#endif // GGML_USE_HIP
         slot.used = false;
     }
 
@@ -2636,12 +2662,12 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
     if (slot.used) {
         CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), slot.h2d_done, 0));
     }
-    CUDA_CHECK(cudaMemcpyAsync(slot.host, src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream()));
+    ggml_cuda_staged_memcpy(slot.host, src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream());
     CUDA_CHECK(cudaEventRecord(slot.d2h_done, ctx_src->stream()));
 
     ggml_cuda_set_device(ctx_dst->device);
     CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), slot.d2h_done, 0));
-    CUDA_CHECK(cudaMemcpyAsync(dst, slot.host, nbytes, cudaMemcpyHostToDevice, ctx_dst->stream()));
+    ggml_cuda_staged_memcpy(dst, slot.host, nbytes, cudaMemcpyHostToDevice, ctx_dst->stream());
     CUDA_CHECK(cudaEventRecord(slot.h2d_done, ctx_dst->stream()));
     slot.used = true;
 
