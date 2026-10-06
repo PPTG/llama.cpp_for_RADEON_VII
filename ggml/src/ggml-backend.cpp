@@ -830,7 +830,6 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
-    int last_rec_copy[GGML_SCHED_MAX_BACKENDS]; // GGML_SCHED_GPU_SERIAL: copy index of the last recorded event, -1: none
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1677,35 +1676,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // earlier split of this graph, so the host would wait for all its work of this graph before queueing more (e.g. the
     // mask of the global layers first used after a split of the other GPU, LLAMA_KV_SPLIT_HEADS)
     std::vector<bool> backend_inputs_copied(sched->n_backends, false);
-    std::vector<bool> backend_recorded(sched->n_backends, false);
-
-    // diagnostics: GGML_SCHED_NO_INPUT_PREFETCH=1 copies the user inputs at each split, GGML_SCHED_COPY_HOST_SYNC=1 waits
-    // on the host for the split backend before each copy of an input, GGML_SCHED_NO_EVENTS=1 does both as without
-    // pipeline parallelism
-    auto env_on = [](const char * name) { const char * v = getenv(name); return v != nullptr && atoi(v) != 0; };
-    static const bool no_events        = env_on("GGML_SCHED_NO_EVENTS");
-    static const bool no_prefetch      = no_events || env_on("GGML_SCHED_NO_INPUT_PREFETCH");
-    static const bool copy_host_sync   = no_events || env_on("GGML_SCHED_COPY_HOST_SYNC");
-    // GGML_SCHED_INPUT_HOST_SYNC=1: the user input copies wait for the whole split backend, not for its event;
-    // GGML_SCHED_PREV_HOST_SYNC=1: the same for the wait on the previous split; GGML_SCHED_RECORD_AFTER_COPY=1: the event
-    // of the source backend is recorded again after an async copy from it, so that it covers the copy
-    static const bool input_host_sync   = no_events || env_on("GGML_SCHED_INPUT_HOST_SYNC");
-    static const bool prev_host_sync    = no_events || env_on("GGML_SCHED_PREV_HOST_SYNC");
-    static const bool record_after_copy = env_on("GGML_SCHED_RECORD_AFTER_COPY");
-    // GGML_SCHED_GPU_SERIAL=1: all work (splits and copies between backends) is ordered on the GPUs in the order of the
-    // splits, also across graphs, without waits on the host
-    static const bool gpu_serial = env_on("GGML_SCHED_GPU_SERIAL");
-    auto serial_record = [&](int b) {
-        if (sched->events[b][sched->cur_copy] != NULL) {
-            ggml_backend_event_record(sched->events[b][sched->cur_copy], sched->backends[b]);
-            sched->last_rec_copy[b] = sched->cur_copy;
-        }
-    };
-    auto serial_wait = [&](int b, int on) {
-        if (on != b && sched->last_rec_copy[on] >= 0 && sched->backends[b]->iface.event_wait != NULL) {
-            ggml_backend_event_wait(sched->backends[b], sched->events[on][sched->last_rec_copy[on]]);
-        }
-    };
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1724,20 +1694,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const bool same_device = prev_backend_id >= 0 &&
             ggml_backend_get_device(sched->backends[prev_backend_id]) == ggml_backend_get_device(split_backend);
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && (!both_gpu || gpu_split_sync || same_device)) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL && !prev_host_sync) {
+            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
         }
 
-        if (gpu_serial) {
-            for (int b = 0; b < sched->n_backends; b++) {
-                serial_wait(split_backend_id, b);
-            }
-        }
-
-        if (sched->n_copies > 1 && !no_prefetch && !backend_inputs_copied[split_backend_id]) {
+        if (sched->n_copies > 1 && !backend_inputs_copied[split_backend_id]) {
             backend_inputs_copied[split_backend_id] = true;
             bool synced = false;
             for (int s = split_id; s < sched->n_splits; s++) {
@@ -1750,7 +1714,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         continue;
                     }
                     if (!synced) {
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL && !input_host_sync) {
+                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
@@ -1768,12 +1732,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-            if ((input->flags & GGML_TENSOR_FLAG_INPUT) && sched->n_copies > 1 && !no_prefetch) {
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) && sched->n_copies > 1) {
                 continue; // copied at the first split of the backend
             }
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL && !input_host_sync) {
+                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -1781,7 +1745,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL && !copy_host_sync) {
+                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -1879,20 +1843,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    const int input_backend_id = tensor_backend_id(input);
-                    if (gpu_serial && input_backend_id >= 0 && input_backend_id != split_backend_id) {
-                        serial_record(split_backend_id);
-                        serial_wait(input_backend_id, split_backend_id);
-                    }
-                    if (split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        if (gpu_serial && input_backend_id >= 0 && input_backend_id != split_backend_id) {
-                            serial_record(input_backend_id);
-                        }
-                        if (record_after_copy && input_backend_id >= 0 && input_backend_id != split_backend_id &&
-                                sched->events[input_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_record(sched->events[input_backend_id][sched->cur_copy], input_backend);
-                        }
-                    } else {
+                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1901,19 +1852,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
-                }
-            }
-        }
-
-        // GGML_SCHED_SAME_DEVICE_WAIT=1 (diagnostics): the split waits on the GPU for the work of this graph queued so far
-        // by the other backends (streams) of its device; they share one compute buffer, which ggml-alloc fills as if
-        // the splits ran in order
-        static const bool same_device_wait = getenv("GGML_SCHED_SAME_DEVICE_WAIT") != nullptr && atoi(getenv("GGML_SCHED_SAME_DEVICE_WAIT")) != 0;
-        if (same_device_wait) {
-            for (int b = 0; b < sched->n_backends; b++) {
-                if (b != split_backend_id && backend_recorded[b] && sched->events[b][sched->cur_copy] != NULL &&
-                    ggml_backend_get_device(sched->backends[b]) == ggml_backend_get_device(split_backend)) {
-                    ggml_backend_event_wait(split_backend, sched->events[b][sched->cur_copy]);
                 }
             }
         }
@@ -1960,8 +1898,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
-            backend_recorded[split_backend_id] = true;
-            sched->last_rec_copy[split_backend_id] = sched->cur_copy;
         }
 
         prev_backend_id = split_backend_id;
@@ -2034,29 +1970,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    // two GPU backends of one device (streams, LLAMA_KV_SPLIT_HEADS) get separate compute buffers: one shared buffer is
-    // filled as if the splits ran in order, but the streams overlap (consecutive graphs: the next graph of one stream
-    // overwrote the tensors of the other stream still in use); GGML_SCHED_SHARE_DEVICE_BUFFER=1 shares it
-    bool own[GGML_SCHED_MAX_BACKENDS] = { false };
-    {
-        const char * share = getenv("GGML_SCHED_SHARE_DEVICE_BUFFER");
-        if (share == nullptr || atoi(share) == 0) {
-            for (int b = 0; b < n_backends; b++) {
-                if (ggml_backend_dev_type(ggml_backend_get_device(backends[b])) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    continue;
-                }
-                for (int o = 0; o < n_backends; o++) {
-                    if (o != b && ggml_backend_get_device(backends[o]) == ggml_backend_get_device(backends[b])) {
-                        own[b] = true;
-                    }
-                }
-            }
-        }
-    }
-    sched->galloc = ggml_gallocr_new_n_own(sched->bufts, own, n_backends);
-    for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
-        sched->last_rec_copy[b] = -1;
-    }
+    sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
     ggml_backend_sched_reset(sched);

@@ -490,12 +490,6 @@ llama_context::llama_context(
             }
         }
 
-        // LLAMA_PIPELINE_PARALLEL_DISABLE=1: one input copy, no overlap of consecutive ubatches (diagnostics)
-        if (pipeline_parallel) {
-            const char * pp_disable = getenv("LLAMA_PIPELINE_PARALLEL_DISABLE");
-            pipeline_parallel = pp_disable == nullptr || atoi(pp_disable) == 0;
-        }
-
         cparams.pipeline_parallel = pipeline_parallel;
 
         if (cparams.pipeline_parallel) {

@@ -1528,8 +1528,6 @@ struct ggml_cuda_staged_copy_slot {
     bool        used       = false;   // h2d_done was recorded at least once
     cudaEvent_t d2h_done   = nullptr; // created on the src device
     cudaEvent_t h2d_done   = nullptr; // created on the dst device
-    uint32_t *  flags      = nullptr; // GGML_CUDA_STAGED_DEBUG=5: [0] = D2H done, [1] = H2D done, pinned
-    uint32_t    seq        = 0;
 };
 
 // slots are added while all are busy, up to this number
