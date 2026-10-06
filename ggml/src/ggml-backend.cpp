@@ -1685,6 +1685,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static const bool no_events        = env_on("GGML_SCHED_NO_EVENTS");
     static const bool no_prefetch      = no_events || env_on("GGML_SCHED_NO_INPUT_PREFETCH");
     static const bool copy_host_sync   = no_events || env_on("GGML_SCHED_COPY_HOST_SYNC");
+    // GGML_SCHED_INPUT_HOST_SYNC=1: the user input copies wait for the whole split backend, not for its event;
+    // GGML_SCHED_PREV_HOST_SYNC=1: the same for the wait on the previous split; GGML_SCHED_RECORD_AFTER_COPY=1: the event
+    // of the source backend is recorded again after an async copy from it, so that it covers the copy
+    static const bool input_host_sync   = no_events || env_on("GGML_SCHED_INPUT_HOST_SYNC");
+    static const bool prev_host_sync    = no_events || env_on("GGML_SCHED_PREV_HOST_SYNC");
+    static const bool record_after_copy = env_on("GGML_SCHED_RECORD_AFTER_COPY");
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1703,7 +1709,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const bool same_device = prev_backend_id >= 0 &&
             ggml_backend_get_device(sched->backends[prev_backend_id]) == ggml_backend_get_device(split_backend);
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && (!both_gpu || gpu_split_sync || same_device)) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL && !no_events) {
+            if (sched->events[prev_backend_id][sched->cur_copy] != NULL && !prev_host_sync) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
@@ -1723,7 +1729,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         continue;
                     }
                     if (!synced) {
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        if (sched->events[split_backend_id][sched->cur_copy] != NULL && !input_host_sync) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
@@ -1746,7 +1752,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL && !no_events) {
+                if (sched->events[split_backend_id][sched->cur_copy] != NULL && !input_host_sync) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -1852,7 +1858,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    if (split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        const int input_backend_id = tensor_backend_id(input);
+                        if (record_after_copy && input_backend_id >= 0 && input_backend_id != split_backend_id &&
+                                sched->events[input_backend_id][sched->cur_copy] != NULL) {
+                            ggml_backend_event_record(sched->events[input_backend_id][sched->cur_copy], input_backend);
+                        }
+                    } else {
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
