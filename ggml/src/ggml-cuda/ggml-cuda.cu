@@ -3952,6 +3952,40 @@ static bool ggml_cuda_fuse_fwht_part(const char * name) {
     return ggml_cuda_fuse_fwht_enabled() && (env == nullptr || atoi(env) != 0);
 }
 
+// A fused kernel writes the outputs of later nodes while it still reads the input of the first one: ggml-alloc may
+// have placed them in the memory of that input (freed after the first node), with another layout, so blocks would
+// overwrite rows other blocks still read. GGML_CUDA_FUSE_OVERLAP_CHECK=0 disables the check (diagnostics).
+static bool ggml_cuda_fused_writes_overlap(const ggml_tensor * in, const ggml_tensor * out0, const ggml_tensor * out1) {
+    static const bool check = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_OVERLAP_CHECK");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!check) {
+        return false;
+    }
+    // the same memory with the same layout is fine: each block reads its rows before it writes them
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        if (a == nullptr || b == nullptr) {
+            return false;
+        }
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        if (!(a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a))) {
+            return false;
+        }
+        return !(a0 == b0 && ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_nbytes(a) == ggml_nbytes(b));
+    };
+    const bool res = overlap(in, out0) || overlap(in, out1);
+    if (res) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_WARN("%s: fused output overlaps the input %s, not fused\n", __func__, in->name);
+        }
+    }
+    return res;
+}
+
 static bool ggml_cuda_is_fwht_node(const ggml_tensor * node) {
     return node->op == GGML_OP_MUL_MAT && ggml_cuda_op_mul_mat_use_fwht(node);
 }
@@ -4979,7 +5013,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_is_fwht_node(fwht) && fwht->src[1] == resh && fwht->src[1]->type == GGML_TYPE_F32 &&
                 ggml_cuda_should_fuse_rms_norm_mul_rope(node, mul, rope) && ggml_is_contiguous(rope) &&
                 fwht->ne[0] == rope->ne[0] && (fwht->ne[0] == 256 || fwht->ne[0] == 512) &&
-                ggml_can_fuse_subgraph(cgraph, i, 5, ops, out, 1)) {
+                ggml_can_fuse_subgraph(cgraph, i, 5, ops, out, 1) &&
+                !ggml_cuda_fused_writes_overlap(node->src[0], rope, fwht)) {
             ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, mul, rope, nullptr, fwht);
             return 4;
         }
