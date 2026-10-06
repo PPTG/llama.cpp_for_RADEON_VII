@@ -830,6 +830,7 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    int last_rec_copy[GGML_SCHED_MAX_BACKENDS]; // GGML_SCHED_GPU_SERIAL: copy index of the last recorded event, -1: none
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1691,6 +1692,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static const bool input_host_sync   = no_events || env_on("GGML_SCHED_INPUT_HOST_SYNC");
     static const bool prev_host_sync    = no_events || env_on("GGML_SCHED_PREV_HOST_SYNC");
     static const bool record_after_copy = env_on("GGML_SCHED_RECORD_AFTER_COPY");
+    // GGML_SCHED_GPU_SERIAL=1: all work (splits and copies between backends) is ordered on the GPUs in the order of the
+    // splits, also across graphs, without waits on the host
+    static const bool gpu_serial = env_on("GGML_SCHED_GPU_SERIAL");
+    auto serial_record = [&](int b) {
+        if (sched->events[b][sched->cur_copy] != NULL) {
+            ggml_backend_event_record(sched->events[b][sched->cur_copy], sched->backends[b]);
+            sched->last_rec_copy[b] = sched->cur_copy;
+        }
+    };
+    auto serial_wait = [&](int b, int on) {
+        if (on != b && sched->last_rec_copy[on] >= 0 && sched->backends[b]->iface.event_wait != NULL) {
+            ggml_backend_event_wait(sched->backends[b], sched->events[on][sched->last_rec_copy[on]]);
+        }
+    };
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1713,6 +1728,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
+            }
+        }
+
+        if (gpu_serial) {
+            for (int b = 0; b < sched->n_backends; b++) {
+                serial_wait(split_backend_id, b);
             }
         }
 
@@ -1858,8 +1879,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                    const int input_backend_id = tensor_backend_id(input);
+                    if (gpu_serial && input_backend_id >= 0 && input_backend_id != split_backend_id) {
+                        serial_record(split_backend_id);
+                        serial_wait(input_backend_id, split_backend_id);
+                    }
                     if (split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        const int input_backend_id = tensor_backend_id(input);
+                        if (gpu_serial && input_backend_id >= 0 && input_backend_id != split_backend_id) {
+                            serial_record(input_backend_id);
+                        }
                         if (record_after_copy && input_backend_id >= 0 && input_backend_id != split_backend_id &&
                                 sched->events[input_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_record(sched->events[input_backend_id][sched->cur_copy], input_backend);
@@ -1933,6 +1961,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             backend_recorded[split_backend_id] = true;
+            sched->last_rec_copy[split_backend_id] = sched->cur_copy;
         }
 
         prev_backend_id = split_backend_id;
@@ -2025,6 +2054,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
     sched->galloc = ggml_gallocr_new_n_own(sched->bufts, own, n_backends);
+    for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+        sched->last_rec_copy[b] = -1;
+    }
     sched->op_offload = op_offload;
 
     ggml_backend_sched_reset(sched);
