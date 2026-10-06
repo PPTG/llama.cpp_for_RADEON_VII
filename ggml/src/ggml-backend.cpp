@@ -1678,6 +1678,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<bool> backend_inputs_copied(sched->n_backends, false);
     std::vector<bool> backend_recorded(sched->n_backends, false);
 
+    // diagnostics: GGML_SCHED_NO_INPUT_PREFETCH=1 copies the user inputs at each split, GGML_SCHED_COPY_HOST_SYNC=1 waits
+    // on the host for the split backend before each copy of an input, GGML_SCHED_NO_EVENTS=1 does both as without
+    // pipeline parallelism
+    auto env_on = [](const char * name) { const char * v = getenv(name); return v != nullptr && atoi(v) != 0; };
+    static const bool no_events        = env_on("GGML_SCHED_NO_EVENTS");
+    static const bool no_prefetch      = no_events || env_on("GGML_SCHED_NO_INPUT_PREFETCH");
+    static const bool copy_host_sync   = no_events || env_on("GGML_SCHED_COPY_HOST_SYNC");
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1695,14 +1703,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const bool same_device = prev_backend_id >= 0 &&
             ggml_backend_get_device(sched->backends[prev_backend_id]) == ggml_backend_get_device(split_backend);
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && (!both_gpu || gpu_split_sync || same_device)) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+            if (sched->events[prev_backend_id][sched->cur_copy] != NULL && !no_events) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
         }
 
-        if (sched->n_copies > 1 && !backend_inputs_copied[split_backend_id]) {
+        if (sched->n_copies > 1 && !no_prefetch && !backend_inputs_copied[split_backend_id]) {
             backend_inputs_copied[split_backend_id] = true;
             bool synced = false;
             for (int s = split_id; s < sched->n_splits; s++) {
@@ -1733,12 +1741,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-            if ((input->flags & GGML_TENSOR_FLAG_INPUT) && sched->n_copies > 1) {
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) && sched->n_copies > 1 && !no_prefetch) {
                 continue; // copied at the first split of the backend
             }
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                if (sched->events[split_backend_id][sched->cur_copy] != NULL && !no_events) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -1746,7 +1754,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                if (sched->events[split_backend_id][sched->cur_copy] != NULL && !copy_host_sync) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
