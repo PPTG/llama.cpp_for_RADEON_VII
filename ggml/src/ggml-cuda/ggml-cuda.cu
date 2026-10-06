@@ -2658,18 +2658,31 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
     if (slot.d2h_done == nullptr) {
         CUDA_CHECK(cudaEventCreateWithFlags(&slot.d2h_done, cudaEventDisableTiming));
     }
+    // diagnostics, GGML_CUDA_STAGED_DEBUG: 1 = wait on the host for the previous H2D from the slot before reusing it,
+    // 2 = for the D2H before queueing the H2D, 3 = for the H2D after queueing it
+    static const int staged_debug = getenv("GGML_CUDA_STAGED_DEBUG") ? atoi(getenv("GGML_CUDA_STAGED_DEBUG")) : 0;
+
     // do not overwrite the slot before the previous H2D from it is done
     if (slot.used) {
+        if (staged_debug == 1) {
+            CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
+        }
         CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), slot.h2d_done, 0));
     }
     ggml_cuda_staged_memcpy(slot.host, src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream());
     CUDA_CHECK(cudaEventRecord(slot.d2h_done, ctx_src->stream()));
+    if (staged_debug == 2) {
+        CUDA_CHECK(cudaEventSynchronize(slot.d2h_done));
+    }
 
     ggml_cuda_set_device(ctx_dst->device);
     CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), slot.d2h_done, 0));
     ggml_cuda_staged_memcpy(dst, slot.host, nbytes, cudaMemcpyHostToDevice, ctx_dst->stream());
     CUDA_CHECK(cudaEventRecord(slot.h2d_done, ctx_dst->stream()));
     slot.used = true;
+    if (staged_debug == 3) {
+        CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
+    }
 
     ggml_cuda_set_device(ctx_src->device);
 }
