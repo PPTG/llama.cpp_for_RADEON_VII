@@ -1676,6 +1676,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // earlier split of this graph, so the host would wait for all its work of this graph before queueing more (e.g. the
     // mask of the global layers first used after a split of the other GPU, LLAMA_KV_SPLIT_HEADS)
     std::vector<bool> backend_inputs_copied(sched->n_backends, false);
+    std::vector<bool> backend_recorded(sched->n_backends, false);
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1856,6 +1857,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // GGML_SCHED_SAME_DEVICE_WAIT=1 (diagnostics): the split waits on the GPU for the work of this graph queued so far
+        // by the other backends (streams) of its device; they share one compute buffer, which ggml-alloc fills as if
+        // the splits ran in order
+        static const bool same_device_wait = getenv("GGML_SCHED_SAME_DEVICE_WAIT") != nullptr && atoi(getenv("GGML_SCHED_SAME_DEVICE_WAIT")) != 0;
+        if (same_device_wait) {
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (b != split_backend_id && backend_recorded[b] && sched->events[b][sched->cur_copy] != NULL &&
+                    ggml_backend_get_device(sched->backends[b]) == ggml_backend_get_device(split_backend)) {
+                    ggml_backend_event_wait(split_backend, sched->events[b][sched->cur_copy]);
+                }
+            }
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1898,6 +1912,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            backend_recorded[split_backend_id] = true;
         }
 
         prev_backend_id = split_backend_id;
