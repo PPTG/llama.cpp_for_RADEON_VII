@@ -758,6 +758,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         if (slot.host != nullptr) {
             CUDA_CHECK(cudaFreeHost(slot.host));
         }
+        if (slot.flags != nullptr) {
+            CUDA_CHECK(cudaFreeHost(slot.flags));
+        }
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -2659,26 +2662,68 @@ static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_back
         CUDA_CHECK(cudaEventCreateWithFlags(&slot.d2h_done, cudaEventDisableTiming));
     }
     // diagnostics, GGML_CUDA_STAGED_DEBUG: 1 = wait on the host for the previous H2D from the slot before reusing it,
-    // 2 = for the D2H before queueing the H2D, 3 = for the H2D after queueing it
+    // 2 = for the D2H before queueing the H2D, 3 = for the H2D after queueing it, 4 = query the D2H event after recording
+    // it, 5 = the streams wait for each other by stream memory operations on pinned flags instead of events
     static const int staged_debug = getenv("GGML_CUDA_STAGED_DEBUG") ? atoi(getenv("GGML_CUDA_STAGED_DEBUG")) : 0;
+
+#ifdef GGML_USE_HIP
+    const bool use_flags = staged_debug == 5;
+    if (use_flags && slot.flags == nullptr) {
+        CUDA_CHECK(hipHostMalloc(&slot.flags, 64, hipHostMallocCoherent));
+        slot.flags[0] = 0;
+        slot.flags[1] = 0;
+        slot.seq      = 0;
+    }
+#else
+    const bool use_flags = false;
+#endif // GGML_USE_HIP
 
     // do not overwrite the slot before the previous H2D from it is done
     if (slot.used) {
         if (staged_debug == 1) {
             CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
         }
-        CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), slot.h2d_done, 0));
+#ifdef GGML_USE_HIP
+        if (use_flags) {
+            CUDA_CHECK(hipStreamWaitValue32(ctx_src->stream(), &slot.flags[1], slot.seq, hipStreamWaitValueGte, 0xFFFFFFFF));
+        } else
+#endif // GGML_USE_HIP
+        {
+            CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), slot.h2d_done, 0));
+        }
     }
+    slot.seq++;
     ggml_cuda_staged_memcpy(slot.host, src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream());
     CUDA_CHECK(cudaEventRecord(slot.d2h_done, ctx_src->stream()));
+#ifdef GGML_USE_HIP
+    if (use_flags) {
+        CUDA_CHECK(hipStreamWriteValue32(ctx_src->stream(), &slot.flags[0], slot.seq, 0));
+    }
+#endif // GGML_USE_HIP
     if (staged_debug == 2) {
         CUDA_CHECK(cudaEventSynchronize(slot.d2h_done));
     }
+    if (staged_debug == 4) {
+        (void) cudaEventQuery(slot.d2h_done);
+        (void) cudaGetLastError();
+    }
 
     ggml_cuda_set_device(ctx_dst->device);
-    CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), slot.d2h_done, 0));
+#ifdef GGML_USE_HIP
+    if (use_flags) {
+        CUDA_CHECK(hipStreamWaitValue32(ctx_dst->stream(), &slot.flags[0], slot.seq, hipStreamWaitValueGte, 0xFFFFFFFF));
+    } else
+#endif // GGML_USE_HIP
+    {
+        CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), slot.d2h_done, 0));
+    }
     ggml_cuda_staged_memcpy(dst, slot.host, nbytes, cudaMemcpyHostToDevice, ctx_dst->stream());
     CUDA_CHECK(cudaEventRecord(slot.h2d_done, ctx_dst->stream()));
+#ifdef GGML_USE_HIP
+    if (use_flags) {
+        CUDA_CHECK(hipStreamWriteValue32(ctx_dst->stream(), &slot.flags[1], slot.seq, 0));
+    }
+#endif // GGML_USE_HIP
     slot.used = true;
     if (staged_debug == 3) {
         CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
